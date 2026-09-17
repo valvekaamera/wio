@@ -1,5 +1,15 @@
 #include <Arduino.h>
 #include "TFT_eSPI.h"
+#include "rpcWiFi.h"
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#endif
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD ""
+#endif
 TFT_eSPI tft;
 #define STATUS_LED LED_BUILTIN
 namespace {
@@ -61,9 +71,132 @@ void printBanner() {
   Serial.println("  led on    - turn status LED on");
   Serial.println("  led off   - turn status LED off");
   Serial.println("  reboot    - reset the board");
+  Serial.println("  wifi version                  - RTL8720 firmware version");
+  Serial.println("  wifi scan                     - list nearby access points");
+  Serial.println("  wifi connect [ssid] [password] - join AP (defaults from wifi_secrets.h)");
+  Serial.println("  wifi status                   - connection state, IP, RSSI");
+  Serial.println("  wifi disconnect               - leave the current AP");
   Serial.println();
 }
+const char* wifiStatusName(int status) {
+  switch (status) {
+    case WL_CONNECTED:       return "CONNECTED";
+    case WL_NO_SSID_AVAIL:   return "NO_SSID_AVAIL";
+    case WL_CONNECT_FAILED:  return "CONNECT_FAILED";
+    case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+    case WL_DISCONNECTED:    return "DISCONNECTED";
+    case WL_IDLE_STATUS:     return "IDLE";
+    case WL_NO_SHIELD:       return "NO_SHIELD";
+    default:                 return "UNKNOWN";
+  }
+}
+void wifiPrintStatus() {
+  const int status = WiFi.status();
+  Serial.print("WiFi status: ");
+  Serial.println(wifiStatusName(status));
+  if (status == WL_CONNECTED) {
+    Serial.print("  SSID : "); Serial.println(WiFi.SSID());
+    Serial.print("  IP   : "); Serial.println(WiFi.localIP());
+    Serial.print("  GW   : "); Serial.println(WiFi.gatewayIP());
+    Serial.print("  RSSI : "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+  }
+}
+void wifiScan() {
+  Serial.println("Scanning...");
+  WiFi.mode(WIFI_STA);
+  const int count = WiFi.scanNetworks();
+  if (count <= 0) {
+    Serial.println("No networks found.");
+    return;
+  }
+  Serial.print(count);
+  Serial.println(" network(s):");
+  for (int i = 0; i < count; ++i) {
+    Serial.print("  ");
+    Serial.print(i + 1);
+    Serial.print(") ");
+    Serial.print(WiFi.SSID(i));
+    Serial.print("  RSSI=");
+    Serial.print(WiFi.RSSI(i));
+    Serial.print(" dBm  ");
+    Serial.println(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open" : "secured");
+  }
+  WiFi.scanDelete();
+}
+void wifiConnect(String ssid, String password) {
+  if (ssid.length() == 0) {
+    ssid = WIFI_SSID;
+    password = WIFI_PASSWORD;
+  }
+  if (ssid.length() == 0) {
+    Serial.println("No SSID given and wifi_secrets.h not present.");
+    Serial.println("Usage: wifi connect <ssid> <password>");
+    return;
+  }
+  Serial.print("Connecting to '");
+  Serial.print(ssid);
+  Serial.print("'");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  const unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000UL) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  wifiPrintStatus();
+}
+void handleWifiCommand(const String& sub, const String& args) {
+  if (sub == "version") {
+    Serial.print("RTL8720 firmware: ");
+    Serial.println(rpc_system_version());
+    return;
+  }
+  if (sub == "scan") {
+    wifiScan();
+    return;
+  }
+  if (sub == "connect") {
+    String ssid = args;
+    String password;
+    const int space = args.indexOf(' ');
+    if (space >= 0) {
+      ssid = args.substring(0, space);
+      password = args.substring(space + 1);
+      password.trim();
+    }
+    wifiConnect(ssid, password);
+    return;
+  }
+  if (sub == "status") {
+    wifiPrintStatus();
+    return;
+  }
+  if (sub == "disconnect") {
+    WiFi.disconnect();
+    Serial.println("Disconnected.");
+    return;
+  }
+  Serial.println("Unknown wifi subcommand. Try: version, scan, connect, status, disconnect");
+}
 void handleSerialCommand(const String& command) {
+  if (command.startsWith("wifi")) {
+    String rest = command.substring(4);
+    rest.trim();
+    String sub = rest;
+    String args;
+    const int space = rest.indexOf(' ');
+    if (space >= 0) {
+      sub = rest.substring(0, space);
+      args = rest.substring(space + 1);
+      args.trim();
+    }
+    sub.toLowerCase();
+    handleWifiCommand(sub, args);
+    return;
+  }
   if (command == "help") {
     printBanner();
     return;
@@ -135,9 +268,17 @@ void loop() {
     const String command = Serial.readStringUntil('\n');
     String trimmed = command;
     trimmed.trim();
-    trimmed.toLowerCase();
     if (trimmed.length() > 0) {
-      handleSerialCommand(trimmed);
+      // Lowercase only the leading keyword so SSIDs/passwords keep their case.
+      String head = trimmed.substring(0, 4);
+      head.toLowerCase();
+      String normalized = trimmed;
+      if (head == "wifi") {
+        normalized = "wifi" + trimmed.substring(4);
+      } else {
+        normalized.toLowerCase();
+      }
+      handleSerialCommand(normalized);
     }
   }
 }

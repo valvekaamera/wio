@@ -3,7 +3,49 @@
 Arduino firmware for the Seeed Studio Wio Terminal D51R (ATSAMD51P19A).
 On USB plug-in it shows a status screen on the LCD, opens USB serial at
 115200 baud, prints a heartbeat every second, and accepts the commands
-`help`, `info`, `led on`, `led off`, `reboot`.
+`help`, `info`, `led on`, `led off`, `reboot`, plus the `wifi ...` commands
+described below.
+
+## Wi-Fi
+
+Wi-Fi on the Wio Terminal runs on a separate RTL8720 co-processor that talks
+to the SAMD51 over eRPC. Two things must be in place before it works:
+
+1. **RTL8720 firmware ≥ 2.0.2** (2.1.x current). This is a one-time host-side
+   step using Seeed's tool; it rewrites the co-processor, not this firmware:
+
+   ```bash
+   git clone https://github.com/Seeed-Studio/ambd_flash_tool.git /tmp/ambd_flash_tool
+   cd /tmp/ambd_flash_tool
+   python3 ambd_flash_tool.py erase
+   python3 ambd_flash_tool.py flash
+   ```
+
+   Afterwards the LCD shows "Burn RTL8720 fw"; that is normal. Flash this
+   project again to get back to the app.
+
+2. **Local credentials.** Copy the template and fill in your network:
+
+   ```bash
+   cp include/wifi_secrets.h.example include/wifi_secrets.h
+   ```
+
+   `include/wifi_secrets.h` is gitignored. Never put the SSID/password in
+   `main.cpp` or commit them.
+
+Then verify over the 115200 serial monitor:
+
+| Command | What it proves |
+| --- | --- |
+| `wifi version` | SAMD51 ↔ RTL8720 link works and firmware is compatible. If this hangs, redo step 1. |
+| `wifi scan` | Radio works; your AP should appear with an RSSI. |
+| `wifi connect` | Joins the AP from `wifi_secrets.h` and prints IP/gateway/RSSI. |
+| `wifi connect <ssid> <password>` | Same, with explicit credentials (case is preserved). |
+| `wifi status` | Current state, IP and RSSI. |
+| `wifi disconnect` | Leave the AP. |
+
+Once `wifi connect` prints an IP, `ping <that-ip>` from your laptop for an
+end-to-end check.
 
 ## Connect and flash next time
 
