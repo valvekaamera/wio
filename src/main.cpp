@@ -26,12 +26,13 @@ const IPAddress kPingTarget(192, 168, 150, 25);
 constexpr uint8_t kPingCount = 4;
 
 // ---- Call emulation (FNOL = First Notice Of Loss) ----------------------
-// A = pick up (start "recording"), B = hang up, C = send to transcription.
-enum class CallState { Idle, Recording, Sending };
+// C = pick up (start "recording"), B = hang up, A = send to transcription.
+enum class CallState { Idle, Recording, HungUp, Sending };
 CallState callState = CallState::Idle;
 unsigned long recordStartMs = 0;
-unsigned long sendingStartMs = 0;
+unsigned long transientStartMs = 0;  // start of HungUp / Sending overlay
 unsigned long lastRecordTickMs = 0;
+constexpr unsigned long kHungUpDisplayMs = 2000UL;
 constexpr unsigned long kSendingDisplayMs = 3000UL;
 constexpr unsigned long kDebounceMs = 40UL;
 constexpr int kHeaderHeight = 40;
@@ -105,6 +106,13 @@ void drawRecordingBody() {
   tft.fillCircle(tft.width() / 2 - 48, labelY, 9, TFT_RED);
   drawRecordingElapsed(0);
 }
+void drawHungUpBody() {
+  clearBody();
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(3);
+  tft.setTextColor(kTextColor, kBgColor);
+  tft.drawString("Hang up", tft.width() / 2, bodyCenterY());
+}
 void drawSendingBody() {
   clearBody();
   tft.setTextDatum(MC_DATUM);
@@ -121,7 +129,7 @@ void drawFooter(const String& uptime) {
   tft.setTextColor(kTextColor, TFT_BLACK);
   tft.drawString("Uptime: " + uptime, 10, footerY + 8);
   tft.setTextColor(kMutedColor, TFT_BLACK);
-  tft.drawString("A: pick up   B: hang up   C: send FNOL", 10, footerY + 24);
+  tft.drawString("C: pick up   B: hang up   A: send FNOL", 10, footerY + 24);
 }
 void enterState(CallState next) {
   const unsigned long now = millis();
@@ -137,8 +145,13 @@ void enterState(CallState next) {
       drawRecordingBody();
       Serial.println("[call] picked up - recording");
       break;
+    case CallState::HungUp:
+      transientStartMs = now;
+      drawHungUpBody();
+      Serial.println("[call] hung up");
+      break;
     case CallState::Sending:
-      sendingStartMs = now;
+      transientStartMs = now;
       drawSendingBody();
       Serial.println("[call] sending FNOL to transcription");
       break;
@@ -147,16 +160,18 @@ void enterState(CallState next) {
 void onButtonPressed(const Button& button) {
   Serial.print("[button] ");
   Serial.println(button.name);
-  if (button.pin == WIO_KEY_A) {
+  if (button.pin == WIO_KEY_C) {
     if (callState == CallState::Idle) enterState(CallState::Recording);
   } else if (button.pin == WIO_KEY_B) {
     if (callState == CallState::Recording) {
-      Serial.print("[call] hung up after ");
+      Serial.print("[call] call duration ");
       Serial.println(formatElapsed(millis() - recordStartMs));
-      enterState(CallState::Idle);
+      enterState(CallState::HungUp);
     }
-  } else if (button.pin == WIO_KEY_C) {
-    if (callState != CallState::Sending) enterState(CallState::Sending);
+  } else if (button.pin == WIO_KEY_A) {
+    if (callState == CallState::Idle || callState == CallState::Recording) {
+      enterState(CallState::Sending);
+    }
   }
 }
 void pollButtons(unsigned long now) {
@@ -177,7 +192,10 @@ void updateCallState(unsigned long now) {
     lastRecordTickMs = now;
     drawRecordingElapsed(now - recordStartMs);
   }
-  if (callState == CallState::Sending && now - sendingStartMs >= kSendingDisplayMs) {
+  if (callState == CallState::HungUp && now - transientStartMs >= kHungUpDisplayMs) {
+    enterState(CallState::Idle);
+  }
+  if (callState == CallState::Sending && now - transientStartMs >= kSendingDisplayMs) {
     enterState(CallState::Idle);
   }
 }

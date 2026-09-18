@@ -10,12 +10,13 @@ buttons emulate a phone call (FNOL = First Notice Of Loss).
 
 | Button | Action | Screen |
 | --- | --- | --- |
-| **A** (right) | Pick up the phone | Red **rec** with elapsed `mm:ss`, updated every second |
-| **B** (middle) | Hang up | Back to **Waiting for FNOL** |
-| **C** (left) | Send to transcription | **Sending FNOL to transcription** for 3 s, then back to idle |
+| **C** (left) | Pick up the phone | Red **rec** with elapsed `mm:ss`, updated every second |
+| **B** (middle) | Hang up | **Hang up** for 2 s, then back to **Waiting for FNOL** |
+| **A** (right) | Send to transcription | **Sending FNOL to transcription** for 3 s, then back to idle |
 
-Rules: A only works while idle, B only while recording, C works from idle or
-recording and ends the call. Every press and state change is also logged to
+Rules: C only works while idle, B only while recording, A works from idle or
+recording and ends the call. Presses during the 2 s / 3 s overlays are
+ignored. Every press and state change is also logged to
 serial (`[button] A`, `[call] picked up - recording`, ...). Button handling
 is non-blocking, so serial commands keep working during a call.
 
