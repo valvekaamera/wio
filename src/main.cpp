@@ -33,7 +33,8 @@ unsigned long recordStartMs = 0;
 unsigned long transientStartMs = 0;  // start of HungUp / Sending overlay
 unsigned long lastRecordTickMs = 0;
 constexpr unsigned long kHungUpDisplayMs = 2000UL;
-constexpr unsigned long kSendingDisplayMs = 3000UL;
+constexpr unsigned long kSendingDisplayMs = 5000UL;
+CallState stateBeforeSending = CallState::Idle;  // where to return after Sending
 constexpr unsigned long kDebounceMs = 40UL;
 constexpr int kHeaderHeight = 40;
 constexpr int kFooterHeight = 44;
@@ -157,6 +158,14 @@ void enterState(CallState next) {
       break;
   }
 }
+// Return to Recording after an overlay without resetting the call timer.
+void resumeRecording() {
+  callState = CallState::Recording;
+  lastRecordTickMs = millis();
+  drawRecordingBody();
+  drawRecordingElapsed(millis() - recordStartMs);
+  Serial.println("[call] back to recording");
+}
 void onButtonPressed(const Button& button) {
   Serial.print("[button] ");
   Serial.println(button.name);
@@ -170,6 +179,7 @@ void onButtonPressed(const Button& button) {
     }
   } else if (button.pin == WIO_KEY_A) {
     if (callState == CallState::Idle || callState == CallState::Recording) {
+      stateBeforeSending = callState;
       enterState(CallState::Sending);
     }
   }
@@ -196,7 +206,11 @@ void updateCallState(unsigned long now) {
     enterState(CallState::Idle);
   }
   if (callState == CallState::Sending && now - transientStartMs >= kSendingDisplayMs) {
-    enterState(CallState::Idle);
+    if (stateBeforeSending == CallState::Recording) {
+      resumeRecording();
+    } else {
+      enterState(CallState::Idle);
+    }
   }
 }
 void printBanner() {
