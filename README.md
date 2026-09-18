@@ -1,10 +1,23 @@
 # Wio Terminal D51R USB Welcome Firmware
 
 Arduino firmware for the Seeed Studio Wio Terminal D51R (ATSAMD51P19A).
-On USB plug-in it shows a status screen on the LCD, opens USB serial at
-115200 baud, shows uptime on the LCD, and accepts the commands
-`help`, `info`, `led on`, `led off`, `reboot`, `ping`, plus the `wifi ...`
-commands described below.
+On boot it shows **Waiting for FNOL** on the LCD, opens USB serial at
+115200 baud, and accepts the commands `help`, `info`, `led on`, `led off`,
+`reboot`, `ping`, plus the `wifi ...` commands described below. The three top
+buttons emulate a phone call (FNOL = First Notice Of Loss).
+
+## Buttons (call emulation)
+
+| Button | Action | Screen |
+| --- | --- | --- |
+| **A** (right) | Pick up the phone | Red **rec** with elapsed `mm:ss`, updated every second |
+| **B** (middle) | Hang up | Back to **Waiting for FNOL** |
+| **C** (left) | Send to transcription | **Sending FNOL to transcription** for 3 s, then back to idle |
+
+Rules: A only works while idle, B only while recording, C works from idle or
+recording and ends the call. Every press and state change is also logged to
+serial (`[button] A`, `[call] picked up - recording`, ...). Button handling
+is non-blocking, so serial commands keep working during a call.
 
 ## Wi-Fi
 

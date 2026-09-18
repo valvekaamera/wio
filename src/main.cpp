@@ -24,36 +24,32 @@ uint32_t heartbeatCount = 0;
 // Host on the LAN used to prove the Wio Terminal can reach other machines.
 const IPAddress kPingTarget(192, 168, 150, 25);
 constexpr uint8_t kPingCount = 4;
-void drawHeader() {
-  tft.fillRect(0, 0, tft.width(), 40, kAccentColor);
-  tft.setTextColor(TFT_BLACK, kAccentColor);
-  tft.setTextSize(2);
-  tft.setTextDatum(MC_DATUM);
-  tft.drawString("Wio Terminal D51R", tft.width() / 2, 20);
-}
-void drawStaticBody() {
-  tft.fillRect(0, 40, tft.width(), tft.height() - 40, kBgColor);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextSize(1);
-  tft.setTextColor(kTextColor, kBgColor);
-  tft.drawString("MCU: ATSAMD51P19A", 10, 54);
-  tft.drawString("CPU: 120 MHz", 10, 72);
-  tft.drawString("USB: Connected", 10, 90);
-  tft.drawString("Serial: 115200 baud", 10, 108);
-  tft.drawLine(10, 126, tft.width() - 10, 126, kMutedColor);
-  tft.setTextColor(kAccentColor, kBgColor);
-  tft.drawString("Open serial monitor to send commands.", 10, 138);
-  tft.drawString("Type 'help' for the command list.", 10, 154);
-}
-void drawFooter(const String& uptime, const String& heartbeat) {
-  const int footerY = tft.height() - 44;
-  tft.fillRect(0, footerY, tft.width(), 44, TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextSize(1);
-  tft.setTextColor(kTextColor, TFT_BLACK);
-  tft.drawString("Uptime: " + uptime, 10, footerY + 8);
-  tft.drawString("Heartbeat: " + heartbeat, 10, footerY + 24);
-}
+
+// ---- Call emulation (FNOL = First Notice Of Loss) ----------------------
+// A = pick up (start "recording"), B = hang up, C = send to transcription.
+enum class CallState { Idle, Recording, Sending };
+CallState callState = CallState::Idle;
+unsigned long recordStartMs = 0;
+unsigned long sendingStartMs = 0;
+unsigned long lastRecordTickMs = 0;
+constexpr unsigned long kSendingDisplayMs = 3000UL;
+constexpr unsigned long kDebounceMs = 40UL;
+constexpr int kHeaderHeight = 40;
+constexpr int kFooterHeight = 44;
+
+struct Button {
+  uint8_t pin;
+  const char* name;
+  bool stableLow;        // debounced pressed state (active LOW)
+  bool lastReadingLow;
+  unsigned long lastChangeMs;
+};
+Button buttons[] = {
+    {WIO_KEY_A, "A", false, false, 0},
+    {WIO_KEY_B, "B", false, false, 0},
+    {WIO_KEY_C, "C", false, false, 0},
+};
+
 String formatUptime(unsigned long ms) {
   const unsigned long totalSeconds = ms / 1000UL;
   const unsigned long hours = totalSeconds / 3600UL;
@@ -62,6 +58,128 @@ String formatUptime(unsigned long ms) {
   char buffer[16];
   snprintf(buffer, sizeof(buffer), "%02lu:%02lu:%02lu", hours, minutes, seconds);
   return String(buffer);
+}
+String formatElapsed(unsigned long ms) {
+  const unsigned long totalSeconds = ms / 1000UL;
+  char buffer[16];
+  snprintf(buffer, sizeof(buffer), "%02lu:%02lu", totalSeconds / 60UL, totalSeconds % 60UL);
+  return String(buffer);
+}
+int bodyTop() { return kHeaderHeight; }
+int bodyHeight() { return tft.height() - kHeaderHeight - kFooterHeight; }
+int bodyCenterY() { return bodyTop() + bodyHeight() / 2; }
+
+void drawHeader() {
+  tft.fillRect(0, 0, tft.width(), kHeaderHeight, kAccentColor);
+  tft.setTextColor(TFT_BLACK, kAccentColor);
+  tft.setTextSize(2);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Wio Terminal D51R", tft.width() / 2, kHeaderHeight / 2);
+}
+void clearBody() {
+  tft.fillRect(0, bodyTop(), tft.width(), bodyHeight(), kBgColor);
+}
+void drawIdleBody() {
+  clearBody();
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(3);
+  tft.setTextColor(kTextColor, kBgColor);
+  tft.drawString("Waiting for FNOL", tft.width() / 2, bodyCenterY());
+}
+void drawRecordingElapsed(unsigned long elapsedMs) {
+  // Only the time string is redrawn each second to avoid flicker.
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(3);
+  tft.setTextColor(kTextColor, kBgColor);
+  tft.setTextPadding(6 * 3 * 6);  // width of "00:00" at size 3, clears old digits
+  tft.drawString(formatElapsed(elapsedMs), tft.width() / 2, bodyCenterY() + 30);
+  tft.setTextPadding(0);
+}
+void drawRecordingBody() {
+  clearBody();
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(4);
+  tft.setTextColor(TFT_RED, kBgColor);
+  const int labelY = bodyCenterY() - 22;
+  tft.drawString("rec", tft.width() / 2 + 14, labelY);
+  tft.fillCircle(tft.width() / 2 - 48, labelY, 9, TFT_RED);
+  drawRecordingElapsed(0);
+}
+void drawSendingBody() {
+  clearBody();
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(3);
+  tft.setTextColor(kAccentColor, kBgColor);
+  tft.drawString("Sending FNOL", tft.width() / 2, bodyCenterY() - 18);
+  tft.drawString("to transcription", tft.width() / 2, bodyCenterY() + 18);
+}
+void drawFooter(const String& uptime) {
+  const int footerY = tft.height() - kFooterHeight;
+  tft.fillRect(0, footerY, tft.width(), kFooterHeight, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextSize(1);
+  tft.setTextColor(kTextColor, TFT_BLACK);
+  tft.drawString("Uptime: " + uptime, 10, footerY + 8);
+  tft.setTextColor(kMutedColor, TFT_BLACK);
+  tft.drawString("A: pick up   B: hang up   C: send FNOL", 10, footerY + 24);
+}
+void enterState(CallState next) {
+  const unsigned long now = millis();
+  callState = next;
+  switch (next) {
+    case CallState::Idle:
+      drawIdleBody();
+      Serial.println("[call] idle - waiting for FNOL");
+      break;
+    case CallState::Recording:
+      recordStartMs = now;
+      lastRecordTickMs = now;
+      drawRecordingBody();
+      Serial.println("[call] picked up - recording");
+      break;
+    case CallState::Sending:
+      sendingStartMs = now;
+      drawSendingBody();
+      Serial.println("[call] sending FNOL to transcription");
+      break;
+  }
+}
+void onButtonPressed(const Button& button) {
+  Serial.print("[button] ");
+  Serial.println(button.name);
+  if (button.pin == WIO_KEY_A) {
+    if (callState == CallState::Idle) enterState(CallState::Recording);
+  } else if (button.pin == WIO_KEY_B) {
+    if (callState == CallState::Recording) {
+      Serial.print("[call] hung up after ");
+      Serial.println(formatElapsed(millis() - recordStartMs));
+      enterState(CallState::Idle);
+    }
+  } else if (button.pin == WIO_KEY_C) {
+    if (callState != CallState::Sending) enterState(CallState::Sending);
+  }
+}
+void pollButtons(unsigned long now) {
+  for (Button& button : buttons) {
+    const bool readingLow = digitalRead(button.pin) == LOW;
+    if (readingLow != button.lastReadingLow) {
+      button.lastReadingLow = readingLow;
+      button.lastChangeMs = now;
+    }
+    if (now - button.lastChangeMs >= kDebounceMs && readingLow != button.stableLow) {
+      button.stableLow = readingLow;
+      if (readingLow) onButtonPressed(button);  // falling edge = press
+    }
+  }
+}
+void updateCallState(unsigned long now) {
+  if (callState == CallState::Recording && now - lastRecordTickMs >= 1000UL) {
+    lastRecordTickMs = now;
+    drawRecordingElapsed(now - recordStartMs);
+  }
+  if (callState == CallState::Sending && now - sendingStartMs >= kSendingDisplayMs) {
+    enterState(CallState::Idle);
+  }
 }
 void printBanner() {
   Serial.println();
@@ -282,13 +400,16 @@ void setup() {
   while (!Serial && (millis() < 3000UL)) {
     delay(10);
   }
+  for (Button& button : buttons) {
+    pinMode(button.pin, INPUT_PULLUP);
+  }
   bootMillis = millis();
   tft.begin();
   tft.setRotation(3);
   tft.fillScreen(kBgColor);
   drawHeader();
-  drawStaticBody();
-  drawFooter("00:00:00", "#0");
+  drawFooter("00:00:00");
+  enterState(CallState::Idle);
   digitalWrite(STATUS_LED, HIGH);
   printBanner();
   Serial.println("Device is ready.");
@@ -298,8 +419,10 @@ void loop() {
   if (now - lastHeartbeatMs >= 1000UL) {
     lastHeartbeatMs = now;
     heartbeatCount++;
-    drawFooter(formatUptime(now - bootMillis), "#" + String(heartbeatCount));
+    drawFooter(formatUptime(now - bootMillis));
   }
+  pollButtons(now);
+  updateCallState(now);
   if (Serial.available()) {
     const String command = Serial.readStringUntil('\n');
     String trimmed = command;
