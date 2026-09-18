@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "TFT_eSPI.h"
 #include "rpcWiFi.h"
+#include "rpcPing.h"
 #if __has_include("wifi_secrets.h")
 #include "wifi_secrets.h"
 #endif
@@ -20,6 +21,9 @@ constexpr uint16_t kMutedColor = TFT_DARKGREY;
 unsigned long bootMillis = 0;
 unsigned long lastHeartbeatMs = 0;
 uint32_t heartbeatCount = 0;
+// Host on the LAN used to prove the Wio Terminal can reach other machines.
+const IPAddress kPingTarget(192, 168, 150, 25);
+constexpr uint8_t kPingCount = 4;
 void drawHeader() {
   tft.fillRect(0, 0, tft.width(), 40, kAccentColor);
   tft.setTextColor(TFT_BLACK, kAccentColor);
@@ -76,7 +80,37 @@ void printBanner() {
   Serial.println("  wifi connect [ssid] [password] - join AP (defaults from wifi_secrets.h)");
   Serial.println("  wifi status                   - connection state, IP, RSSI");
   Serial.println("  wifi disconnect               - leave the current AP");
+  Serial.println("  ping [ip]                     - ICMP ping (default 192.168.150.25)");
   Serial.println();
+}
+void pingHost(const String& arg) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Not connected. Run 'wifi connect' first.");
+    return;
+  }
+  IPAddress target = kPingTarget;
+  if (arg.length() > 0 && !target.fromString(arg)) {
+    Serial.print("Invalid IP address: ");
+    Serial.println(arg);
+    return;
+  }
+  Serial.print("PING ");
+  Serial.print(target);
+  Serial.print(" x");
+  Serial.print(kPingCount);
+  Serial.println(" ...");
+  const bool ok = Ping.ping(target, kPingCount);
+  if (ok) {
+    Serial.print("Reply from ");
+    Serial.print(target);
+    Serial.print(": avg ");
+    Serial.print(Ping.averageTime(), 1);
+    Serial.println(" ms");
+  } else {
+    Serial.print("No reply from ");
+    Serial.print(target);
+    Serial.println(" (host down, firewall, or wrong subnet?)");
+  }
 }
 const char* wifiStatusName(int status) {
   switch (status) {
@@ -197,6 +231,12 @@ void handleSerialCommand(const String& command) {
     handleWifiCommand(sub, args);
     return;
   }
+  if (command == "ping" || command.startsWith("ping ")) {
+    String arg = command.substring(4);
+    arg.trim();
+    pingHost(arg);
+    return;
+  }
   if (command == "help") {
     printBanner();
     return;
@@ -259,10 +299,6 @@ void loop() {
     lastHeartbeatMs = now;
     heartbeatCount++;
     drawFooter(formatUptime(now - bootMillis), "#" + String(heartbeatCount));
-    Serial.print("[heartbeat ");
-    Serial.print(heartbeatCount);
-    Serial.print("] uptime=");
-    Serial.println(formatUptime(now - bootMillis));
   }
   if (Serial.available()) {
     const String command = Serial.readStringUntil('\n');

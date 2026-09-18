@@ -2,9 +2,9 @@
 
 Arduino firmware for the Seeed Studio Wio Terminal D51R (ATSAMD51P19A).
 On USB plug-in it shows a status screen on the LCD, opens USB serial at
-115200 baud, prints a heartbeat every second, and accepts the commands
-`help`, `info`, `led on`, `led off`, `reboot`, plus the `wifi ...` commands
-described below.
+115200 baud, shows uptime on the LCD, and accepts the commands
+`help`, `info`, `led on`, `led off`, `reboot`, `ping`, plus the `wifi ...`
+commands described below.
 
 ## Wi-Fi
 
@@ -43,9 +43,12 @@ Then verify over the 115200 serial monitor:
 | `wifi connect <ssid> <password>` | Same, with explicit credentials (case is preserved). |
 | `wifi status` | Current state, IP and RSSI. |
 | `wifi disconnect` | Leave the AP. |
+| `ping` | ICMP ping to the fixed LAN host `192.168.150.25` (4 packets); proves the Wio can reach other machines. |
+| `ping <ip>` | Same, to another address. |
 
-Once `wifi connect` prints an IP, `ping <that-ip>` from your laptop for an
-end-to-end check.
+Once `wifi connect` prints an IP, run `ping` on the Wio and `ping <wio-ip>`
+from your laptop for a check in both directions. The fixed target lives in
+`kPingTarget` in `src/main.cpp`.
 
 ## Connect and flash next time
 
