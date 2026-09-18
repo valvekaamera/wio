@@ -6,3 +6,9 @@
 
 # Local Wi-Fi credentials - never commit
 include/wifi_secrets.h
+
+# Backend build output and captured audio
+backend/target/
+backend/recordings/
+recordings/
+backend/.env

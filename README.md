@@ -6,13 +6,46 @@ On boot it shows **Waiting for FNOL** on the LCD, opens USB serial at
 `reboot`, `ping`, plus the `wifi ...` commands described below. The three top
 buttons emulate a phone call (FNOL = First Notice Of Loss).
 
+## Audio capture and transcription
+
+```
+Wio Terminal                         backend/ (Spring Boot, Java 25)            Azure AI Foundry
+mic -> ADC1 16 kHz ---ring buffer--> WebSocket ws://host:8090/ws/audio  -->   Whisper (fi)
+buttons C / A / B                    stores recordings/<session>/*.wav          transcript -> log
+```
+
+- **C** starts a session: connects to the backend, sends `start`, then
+  streams 16-bit PCM in 64 ms frames while the red **rec** screen runs.
+- **A** sends `transcribe`: the backend cuts the audio received so far into
+  `segment-NNN.wav` and sends it to the Whisper deployment; the Finnish text
+  is logged on the server and echoed back to the Wio, which shows it under
+  the timer.
+- **B** sends `stop`: the backend writes `session.wav` and closes.
+
+The wire contract is in [`docs/audio-ws-protocol.md`](docs/audio-ws-protocol.md);
+backend setup and configuration in [`backend/README.md`](backend/README.md).
+
+Firmware configuration: backend host/port live in `include/app_config.h`
+(default `192.168.150.25:8090`) and can be overridden from the gitignored
+`include/wifi_secrets.h`. The Wio connects to Wi-Fi at boot and again when C
+is pressed if it is not connected; if the backend is unreachable the screen
+shows **OFFLINE - audio not sent** and recording continues locally without
+storage (there is no SD card fallback yet).
+
+Capture details: ADC1 free-runs on `WIO_MIC` (PC30/AIN12) and TC4 latches a
+sample every 62.5 µs into a 4096-sample lock-free ring; a 10 Hz DC blocker
+and 2× software gain are applied in the ISR. `status` on the serial console
+shows mic overruns, bytes streamed and dropped frames. This capture path has
+been compiled and reviewed but **not yet verified on the device**; check the
+level bar moves when you speak and inspect `segment-001.wav` on the server.
+
 ## Buttons (call emulation)
 
 | Button | Action | Screen |
 | --- | --- | --- |
-| **C** (left) | Pick up the phone | Red **rec** with elapsed `mm:ss`, updated every second |
-| **B** (middle) | Hang up | **Hang up** for 2 s, then back to **Waiting for FNOL** |
-| **A** (right) | Send to transcription | **Sending FNOL to transcription** for 5 s, then back to the previous screen |
+| **C** (left) | Pick up the phone; start mic capture and WebSocket session | Red **rec** with elapsed `mm:ss`, level bar, backend status, last transcript |
+| **B** (middle) | Hang up; send `stop`, close session | **Hang up** for 2 s, then back to **Waiting for FNOL** |
+| **A** (right) | Send `transcribe` to the backend | **Sending FNOL to transcription** for 5 s, then back to the previous screen |
 
 Rules: C only works while idle, B only while recording. A works from idle or
 recording; after the 5 s overlay it returns to where it came from, so a call
@@ -60,6 +93,7 @@ Then verify over the 115200 serial monitor:
 | `wifi disconnect` | Leave the AP. |
 | `ping` | ICMP ping to the fixed LAN host `192.168.150.25` (4 packets); proves the Wio can reach other machines. |
 | `ping <ip>` | Same, to another address. |
+| `status` | Call state, mic ring/overruns, stream state and bytes sent, Wi-Fi. |
 
 Once `wifi connect` prints an IP, run `ping` on the Wio and `ping <wio-ip>`
 from your laptop for a check in both directions. The fixed target lives in

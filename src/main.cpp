@@ -11,6 +11,9 @@
 #ifndef WIFI_PASSWORD
 #define WIFI_PASSWORD ""
 #endif
+#include "app_config.h"
+#include "audio_stream.h"
+#include "mic_capture.h"
 TFT_eSPI tft;
 #define STATUS_LED LED_BUILTIN
 namespace {
@@ -38,6 +41,12 @@ CallState stateBeforeSending = CallState::Idle;  // where to return after Sendin
 constexpr unsigned long kDebounceMs = 40UL;
 constexpr int kHeaderHeight = 40;
 constexpr int kFooterHeight = 44;
+constexpr unsigned long kWifiConnectTimeoutMs = 15000UL;
+constexpr int kTranscriptLines = 3;
+constexpr int kTranscriptCols = 52;               // 320 px / 6 px per char at size 1
+String lastTranscript;                            // ASCII-folded for the LCD
+bool transcriptDirty = false;
+const char* wifiStatusName(int status);
 
 struct Button {
   uint8_t pin;
@@ -88,24 +97,158 @@ void drawIdleBody() {
   tft.setTextColor(kTextColor, kBgColor);
   tft.drawString("Waiting for FNOL", tft.width() / 2, bodyCenterY());
 }
+// Recording screen layout (body spans y=40..196):
+//   y=66   red dot + "rec"          y=100  mm:ss timer
+//   y=120  level bar                y=132  backend status line
+//   y=148+ transcript (3 lines)
+constexpr int kRecLabelY = 66;
+constexpr int kRecTimerY = 100;
+constexpr int kRecLevelY = 120;
+constexpr int kRecStatusY = 132;
+constexpr int kRecTranscriptY = 148;
+
 void drawRecordingElapsed(unsigned long elapsedMs) {
   // Only the time string is redrawn each second to avoid flicker.
   tft.setTextDatum(MC_DATUM);
   tft.setTextSize(3);
   tft.setTextColor(kTextColor, kBgColor);
   tft.setTextPadding(6 * 3 * 6);  // width of "00:00" at size 3, clears old digits
-  tft.drawString(formatElapsed(elapsedMs), tft.width() / 2, bodyCenterY() + 30);
+  tft.drawString(formatElapsed(elapsedMs), tft.width() / 2, kRecTimerY);
   tft.setTextPadding(0);
+}
+void drawRecordingLevel(uint16_t peak) {
+  const int x0 = 40, w = tft.width() - 80, h = 6;
+  const int fill = static_cast<int>((static_cast<uint32_t>(peak) * w) / 32768UL);
+  tft.fillRect(x0, kRecLevelY, w, h, TFT_BLACK);
+  tft.fillRect(x0, kRecLevelY, fill, h, peak > 30000 ? TFT_RED : TFT_GREEN);
+}
+void drawRecordingStatus() {
+  String line;
+  uint16_t color = kMutedColor;
+  switch (stream::state()) {
+    case stream::State::Connecting:
+      line = String("backend ") + stream::host() + ":" + stream::port() + " connecting...";
+      color = TFT_ORANGE;
+      break;
+    case stream::State::Streaming:
+      line = String("streaming to ") + stream::host() + "  " + String(stream::bytesSent() / 1024) + " KB";
+      if (stream::framesDropped() > 0) line += "  drop " + String(stream::framesDropped());
+      color = kAccentColor;
+      break;
+    case stream::State::Stopping:
+      line = "closing session...";
+      break;
+    default:
+      line = "OFFLINE - audio not sent";
+      color = TFT_RED;
+      break;
+  }
+  if (mic::overruns() > 0) line += "  ovr " + String(mic::overruns());
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextSize(1);
+  tft.setTextColor(color, kBgColor);
+  tft.setTextPadding(tft.width() - 20);
+  tft.drawString(line, 10, kRecStatusY);
+  tft.setTextPadding(0);
+}
+void drawRecordingTranscript() {
+  tft.fillRect(0, kRecTranscriptY, tft.width(), bodyTop() + bodyHeight() - kRecTranscriptY, kBgColor);
+  if (lastTranscript.length() == 0) return;
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextSize(1);
+  tft.setTextColor(kTextColor, kBgColor);
+  // Show the tail of the transcript, word-wrapped into up to kTranscriptLines lines.
+  String lines[kTranscriptLines];
+  int count = 0;
+  String current;
+  int start = 0;
+  while (start <= static_cast<int>(lastTranscript.length())) {
+    int end = lastTranscript.indexOf(' ', start);
+    if (end < 0) end = lastTranscript.length();
+    String word = lastTranscript.substring(start, end);
+    if (current.length() + word.length() + 1 > kTranscriptCols && current.length() > 0) {
+      lines[count % kTranscriptLines] = current;
+      count++;
+      current = word;
+    } else {
+      current = current.length() ? current + " " + word : word;
+    }
+    start = end + 1;
+  }
+  lines[count % kTranscriptLines] = current;
+  count++;
+  const int shown = count < kTranscriptLines ? count : kTranscriptLines;
+  for (int i = 0; i < shown; ++i) {
+    const String& l = lines[(count - shown + i) % kTranscriptLines];
+    tft.drawString(l, 10, kRecTranscriptY + i * 12);
+  }
 }
 void drawRecordingBody() {
   clearBody();
   tft.setTextDatum(MC_DATUM);
   tft.setTextSize(4);
   tft.setTextColor(TFT_RED, kBgColor);
-  const int labelY = bodyCenterY() - 22;
-  tft.drawString("rec", tft.width() / 2 + 14, labelY);
-  tft.fillCircle(tft.width() / 2 - 48, labelY, 9, TFT_RED);
+  tft.drawString("rec", tft.width() / 2 + 14, kRecLabelY);
+  tft.fillCircle(tft.width() / 2 - 48, kRecLabelY, 9, TFT_RED);
   drawRecordingElapsed(0);
+  drawRecordingLevel(0);
+  drawRecordingStatus();
+  drawRecordingTranscript();
+}
+void drawConnectingWifiBody() {
+  clearBody();
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_ORANGE, kBgColor);
+  tft.drawString("Connecting Wi-Fi...", tft.width() / 2, bodyCenterY() - 10);
+  tft.setTextSize(1);
+  tft.setTextColor(kMutedColor, kBgColor);
+  tft.drawString(WIFI_SSID, tft.width() / 2, bodyCenterY() + 14);
+}
+// TFT_eSPI's built-in font has no UTF-8 glyphs; fold Finnish letters for the LCD only.
+String asciiFold(const char* utf8) {
+  String out;
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(utf8); *p; ++p) {
+    if (*p == 0xC3 && p[1]) {
+      const unsigned char c = p[1];
+      ++p;
+      switch (c) {
+        case 0xA4: case 0xA5: out += 'a'; break;   // ä å
+        case 0xB6: out += 'o'; break;              // ö
+        case 0x84: case 0x85: out += 'A'; break;   // Ä Å
+        case 0x96: out += 'O'; break;              // Ö
+        default: out += '?'; break;
+      }
+    } else if (*p < 0x80) {
+      out += static_cast<char>(*p);
+    } else if ((*p & 0xC0) != 0x80) {
+      out += '?';                                  // other multi-byte lead byte
+    }
+  }
+  return out;
+}
+bool ensureWifiConnected() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  if (strlen(WIFI_SSID) == 0) {
+    Serial.println("[wifi] no credentials (wifi_secrets.h missing) - recording offline");
+    return false;
+  }
+  Serial.print("[wifi] connecting to ");
+  Serial.println(WIFI_SSID);
+  drawConnectingWifiBody();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  const unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < kWifiConnectTimeoutMs) {
+    delay(200);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[wifi] connected, IP ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+  Serial.println("[wifi] connection failed - recording offline");
+  return false;
 }
 void drawHungUpBody() {
   clearBody();
@@ -128,7 +271,15 @@ void drawFooter(const String& uptime) {
   tft.setTextDatum(TL_DATUM);
   tft.setTextSize(1);
   tft.setTextColor(kTextColor, TFT_BLACK);
-  tft.drawString("Uptime: " + uptime, 10, footerY + 8);
+  String line = "Uptime " + uptime + "   WiFi: ";
+  if (WiFi.status() == WL_CONNECTED) {
+    line += WiFi.localIP().toString();
+  } else if (strlen(WIFI_SSID) == 0) {
+    line += "no config";
+  } else {
+    line += "offline";
+  }
+  tft.drawString(line, 10, footerY + 8);
   tft.setTextColor(kMutedColor, TFT_BLACK);
   tft.drawString("C: pick up   B: hang up   A: send FNOL", 10, footerY + 24);
 }
@@ -141,22 +292,42 @@ void enterState(CallState next) {
       Serial.println("[call] idle - waiting for FNOL");
       break;
     case CallState::Recording:
-      recordStartMs = now;
-      lastRecordTickMs = now;
+      lastTranscript = "";
+      ensureWifiConnected();
+      mic::start();
+      stream::startSession();
+      recordStartMs = millis();
+      lastRecordTickMs = recordStartMs;
       drawRecordingBody();
-      Serial.println("[call] picked up - recording");
+      Serial.println("[call] picked up - recording + streaming");
       break;
     case CallState::HungUp:
       transientStartMs = now;
+      mic::stop();
+      stream::stopSession();
       drawHungUpBody();
       Serial.println("[call] hung up");
       break;
     case CallState::Sending:
       transientStartMs = now;
       drawSendingBody();
-      Serial.println("[call] sending FNOL to transcription");
+      if (stream::state() == stream::State::Streaming) {
+        stream::requestTranscribe();
+        Serial.println("[call] sending FNOL to transcription");
+      } else {
+        Serial.println("[call] send requested but no active stream - nothing sent");
+      }
       break;
   }
+}
+void onTranscriptReceived(int segment, const char* text) {
+  (void)segment;
+  lastTranscript = asciiFold(text);
+  transcriptDirty = true;
+}
+void onStreamStatus(stream::State state) {
+  (void)state;
+  if (callState == CallState::Recording) drawRecordingStatus();
 }
 // Return to Recording after an overlay without resetting the call timer.
 void resumeRecording() {
@@ -201,6 +372,12 @@ void updateCallState(unsigned long now) {
   if (callState == CallState::Recording && now - lastRecordTickMs >= 1000UL) {
     lastRecordTickMs = now;
     drawRecordingElapsed(now - recordStartMs);
+    drawRecordingLevel(mic::takePeak());
+    drawRecordingStatus();
+  }
+  if (callState == CallState::Recording && transcriptDirty) {
+    transcriptDirty = false;
+    drawRecordingTranscript();
   }
   if (callState == CallState::HungUp && now - transientStartMs >= kHungUpDisplayMs) {
     enterState(CallState::Idle);
@@ -231,6 +408,44 @@ void printBanner() {
   Serial.println("  wifi status                   - connection state, IP, RSSI");
   Serial.println("  wifi disconnect               - leave the current AP");
   Serial.println("  ping [ip]                     - ICMP ping (default 192.168.150.25)");
+  Serial.println("  status                        - call state, mic, stream and Wi-Fi summary");
+  Serial.println();
+  Serial.print("Backend: ws://");
+  Serial.print(BACKEND_HOST);
+  Serial.print(":");
+  Serial.print(BACKEND_PORT);
+  Serial.println(BACKEND_WS_PATH);
+  Serial.println();
+}
+const char* callStateName(CallState s) {
+  switch (s) {
+    case CallState::Idle: return "Idle";
+    case CallState::Recording: return "Recording";
+    case CallState::HungUp: return "HungUp";
+    case CallState::Sending: return "Sending";
+  }
+  return "?";
+}
+const char* streamStateName(stream::State s) {
+  switch (s) {
+    case stream::State::Idle: return "Idle";
+    case stream::State::Connecting: return "Connecting";
+    case stream::State::Streaming: return "Streaming";
+    case stream::State::Stopping: return "Stopping";
+  }
+  return "?";
+}
+void printStatus() {
+  Serial.print("Call state : "); Serial.println(callStateName(callState));
+  Serial.print("Mic        : "); Serial.print(mic::isRunning() ? "running" : "stopped");
+  Serial.print(", "); Serial.print(mic::available()); Serial.print(" samples queued, overruns ");
+  Serial.println(mic::overruns());
+  Serial.print("Stream     : "); Serial.print(streamStateName(stream::state()));
+  Serial.print(", session "); Serial.print(stream::sessionId());
+  Serial.print(", sent "); Serial.print(stream::bytesSent()); Serial.print(" B, dropped frames ");
+  Serial.println(stream::framesDropped());
+  Serial.print("Wi-Fi      : "); Serial.print(wifiStatusName(WiFi.status()));
+  if (WiFi.status() == WL_CONNECTED) { Serial.print(" "); Serial.print(WiFi.localIP()); }
   Serial.println();
 }
 void pingHost(const String& arg) {
@@ -391,6 +606,10 @@ void handleSerialCommand(const String& command) {
     printBanner();
     return;
   }
+  if (command == "status") {
+    printStatus();
+    return;
+  }
   if (command == "info") {
     Serial.println("Board: Seeed Wio Terminal D51R");
     Serial.println("MCU: ATSAMD51P19A");
@@ -442,6 +661,18 @@ void setup() {
   drawHeader();
   drawFooter("00:00:00");
   enterState(CallState::Idle);
+
+  mic::begin();
+  stream::begin(BACKEND_HOST, BACKEND_PORT, BACKEND_WS_PATH, DEVICE_NAME, TRANSCRIPTION_LANGUAGE);
+  stream::onTranscript(onTranscriptReceived);
+  stream::onStatus(onStreamStatus);
+
+  // Kick off Wi-Fi in the background so the first call does not have to wait for it.
+  if (strlen(WIFI_SSID) > 0) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+
   digitalWrite(STATUS_LED, HIGH);
   printBanner();
   Serial.println("Device is ready.");
@@ -455,6 +686,7 @@ void loop() {
   }
   pollButtons(now);
   updateCallState(now);
+  stream::loop();
   if (Serial.available()) {
     const String command = Serial.readStringUntil('\n');
     String trimmed = command;
