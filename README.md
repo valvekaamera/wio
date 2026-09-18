@@ -10,14 +10,14 @@ buttons emulate a phone call (FNOL = First Notice Of Loss).
 
 ```
 Wio Terminal                         backend/ (Spring Boot, Java 25)            Azure AI Foundry
-mic -> ADC1 16 kHz ---ring buffer--> WebSocket ws://host:8090/ws/audio  -->   Whisper (fi)
+mic -> ADC1 16 kHz ---ring buffer--> WebSocket ws://host:8090/ws/audio  -->   gpt-4o-mini-transcribe (fi)
 buttons C / A / B                    stores recordings/<session>/*.wav          transcript -> log
 ```
 
 - **C** starts a session: connects to the backend, sends `start`, then
   streams 16-bit PCM in 64 ms frames while the red **rec** screen runs.
 - **A** sends `transcribe`: the backend cuts the audio received so far into
-  `segment-NNN.wav` and sends it to the Whisper deployment; the Finnish text
+  `segment-NNN.wav` and sends it to the transcription deployment; the Finnish text
   is logged on the server and echoed back to the Wio, which shows it under
   the timer.
 - **B** sends `stop`: the backend writes `session.wav` and closes.
