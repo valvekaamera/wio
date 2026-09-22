@@ -18,6 +18,7 @@ WebSocketsClient ws;
 stream::State currentState = stream::State::Idle;
 stream::TranscriptCallback transcriptCb = nullptr;
 stream::StatusCallback statusCb = nullptr;
+stream::AdvisorCallback advisorCb = nullptr;
 
 const char* cfgHost = "";
 uint16_t cfgPort = 0;
@@ -93,6 +94,25 @@ void handleServerText(uint8_t* payload, size_t length) {
     Serial.print("] ");
     Serial.println(text);
     if (transcriptCb) transcriptCb(segment, text);
+  } else if (strcmp(type, "advisor") == 0) {
+    const char* status = doc["status"] | "";
+    const char* message = doc["message"] | "";
+    JsonArrayConst questions = doc["questions"].as<JsonArrayConst>();
+    const int count = questions.isNull() ? 0 : static_cast<int>(questions.size());
+    Serial.print("[advisor] ");
+    Serial.print(status);
+    Serial.print(": ");
+    Serial.println(message);
+    for (JsonVariantConst q : questions) {
+      Serial.print("  - ");
+      Serial.println(q.as<const char*>());
+    }
+    stream::AdvisorStatus st = stream::AdvisorStatus::Error;
+    if (strcmp(status, "WORKING") == 0) st = stream::AdvisorStatus::Working;
+    else if (strcmp(status, "VALMIS_KORVAUSRATKAISUUN") == 0) st = stream::AdvisorStatus::Ready;
+    else if (strcmp(status, "LISAKYSYMYKSET") == 0) st = stream::AdvisorStatus::Questions;
+    const char* first = count > 0 ? (questions[0] | "") : "";
+    if (advisorCb) advisorCb(st, message, count, first);
   } else if (strcmp(type, "stopped") == 0) {
     if (currentState == stream::State::Stopping) {
       ws.disconnect();
@@ -167,6 +187,7 @@ void stream::begin(const char* host, uint16_t port, const char* path, const char
 
 void stream::onTranscript(TranscriptCallback cb) { transcriptCb = cb; }
 void stream::onStatus(StatusCallback cb) { statusCb = cb; }
+void stream::onAdvisor(AdvisorCallback cb) { advisorCb = cb; }
 
 void stream::startSession() {
   if (currentState != State::Idle) return;

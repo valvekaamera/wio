@@ -1,6 +1,6 @@
 # Audio streaming WebSocket contract
 
-Endpoint: `ws://<backend-host>:8080/ws/audio`
+Endpoint: `ws://<backend-host>:8090/ws/audio`
 
 The contract is deliberately client-agnostic. The Wio Terminal, a browser
 tab (`AudioWorklet` → PCM), or a telephony adapter can all act as the client
@@ -50,7 +50,9 @@ could send larger frames. Frame size carries no meaning to the server.
 
 Cuts the audio received since the previous cut (or since `start`) into a
 segment, stores it as WAV, and sends it to the transcription model. Audio
-capture continues; subsequent frames start the next segment.
+capture continues; subsequent frames start the next segment. When the claim
+advisor is enabled the transcript is then fed to the advisor loop and an
+`advisor` event follows (see below).
 
 ### `stop` — Wio button B
 
@@ -58,29 +60,68 @@ capture continues; subsequent frames start the next segment.
 { "type": "stop" }
 ```
 
-Finalises the session: any pending (non-empty) segment is transcribed,
-the full-session WAV is written, and the server replies with `stopped`.
-Either side may then close the socket. Closing the socket without `stop`
-is treated as an implicit `stop`.
+Finalises the session: any pending (non-empty) segment is transcribed
+(but not fed to the advisor — the handler has hung up), the full-session
+WAV is written, and the server replies with `stopped`. The FNOL call
+summary is then printed in the server log with status `KESKEN` or
+`VALMIS KORVAUSRATKAISUUN`. Either side may then close the socket. Closing
+the socket without `stop` is treated as an implicit `stop`.
 
 ## Server → client events
 
 ```json
-{ "type": "ready", "sessionId": "wio-1a2b3c-0007", "format": { "encoding": "pcm_s16le", "sampleRate": 16000, "channels": 1 } }
+{ "type": "ready", "sessionId": "wio-1a2b3c-0007", "format": { "encoding": "pcm_s16le", "sampleRate": 16000, "channels": 1 }, "transcriptionEnabled": true, "advisorEnabled": true }
 
 { "type": "segment", "sessionId": "...", "segment": 1, "durationMs": 4812, "file": "recordings/20260918-150501-wio-1a2b3c-0007/segment-001.wav" }
 
 { "type": "transcript", "sessionId": "...", "segment": 1, "language": "fi", "text": "Hei, haluaisin ilmoittaa vahingosta." }
+
+{ "type": "advisor", "sessionId": "...", "segment": 1, "status": "WORKING", "message": "Analysoidaan..." }
+
+{ "type": "advisor", "sessionId": "...", "segment": 1, "status": "LISAKYSYMYKSET", "message": "Lisäkysymyksiä: 2",
+  "questions": ["Voisitteko toistaa henkilötunnuksenne numero kerrallaan?", "Onko pesukone kiinteästi asennettu keittiökalusteisiin?"] }
+
+{ "type": "advisor", "sessionId": "...", "segment": 2, "status": "VALMIS_KORVAUSRATKAISUUN", "message": "Kiitos, otamme teihin pian yhteyttä." }
+
+{ "type": "advisor", "sessionId": "...", "segment": 2, "status": "ERROR", "message": "Neuvoja ei vastannut" }
 
 { "type": "stopped", "sessionId": "...", "segments": 2, "durationMs": 9130, "file": "recordings/20260918-150501-wio-1a2b3c-0007/session.wav" }
 
 { "type": "error", "sessionId": "...", "message": "unsupported encoding: opus" }
 ```
 
-`transcript` may arrive well after `segment` (Whisper is batch-only) and
-may arrive after `stopped` if the last segment was still in flight.
+`transcript` may arrive well after `segment` (transcription is batch-only)
+and may arrive after `stopped` if the last segment was still in flight.
 Clients must not assume ordering between `segment`/`transcript` events and
 binary acknowledgement; there is no per-frame ack.
+
+### `advisor` — claim-advisor verdict for a segment
+
+Sent only when the advisor is enabled (`ready.advisorEnabled`). `WORKING`
+follows every `transcript` immediately; the verdict arrives seconds to tens
+of seconds later:
+
+| `status` | Meaning | What the handler does |
+| --- | --- | --- |
+| `WORKING` | LLM round in progress | wait |
+| `LISAKYSYMYKSET` | essential facts missing / ambiguous; `questions` lists them (also in the server log with the transcript so far) | ask the caller, then send `transcribe` again |
+| `VALMIS_KORVAUSRATKAISUUN` | identity, loss and policy match established; `message` is the closing phrase | say the phrase, send `stop` |
+| `ERROR` | round failed (model/tool error); case stays `KESKEN` | retry with `transcribe` or hang up |
+
+Rounds are serialised per session in segment order, and later rounds see
+the whole conversation, so a client may keep sending `transcribe` until it
+gets `VALMIS_KORVAUSRATKAISUUN`.
+
+## Text-only entry (no audio)
+
+The same advisor loop is reachable over HTTP for adapters that already
+have text, and for replaying transcripts during development:
+
+```
+POST   /api/fnol/{caseId}/segments   {"text": "..."}   -> decision JSON for this round
+POST   /api/fnol/{caseId}/hangup                       -> prints the FNOL summary, returns status
+DELETE /api/fnol/{caseId}
+```
 
 ## Storage layout on the server
 

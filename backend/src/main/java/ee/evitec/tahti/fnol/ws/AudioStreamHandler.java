@@ -5,12 +5,17 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import ee.evitec.tahti.fnol.agent.AdvisorDecision;
+import ee.evitec.tahti.fnol.agent.ClaimAdvisor;
+import ee.evitec.tahti.fnol.agent.FnolCase;
 import ee.evitec.tahti.fnol.audio.AudioStorage;
 import ee.evitec.tahti.fnol.audio.CaptureSession;
 import ee.evitec.tahti.fnol.audio.PcmFormat;
@@ -28,10 +33,12 @@ import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
 
 /**
- * One WebSocket connection = one capture session. All work for a session runs on that
- * session's own single-thread executor backed by a virtual thread, so the container
- * thread is never blocked and per-session state needs no locking. Transcription calls
- * run on separate virtual threads so audio ingest continues while Whisper works.
+ * One WebSocket connection = one capture session = one FNOL call. All ingest work for a
+ * session runs on that session's own single-thread executor backed by a virtual thread, so
+ * the container thread is never blocked and per-session state needs no locking.
+ * Transcription runs on a shared virtual-thread pool; the claim-advisor rounds run on a
+ * second per-session serial executor so rounds stay in segment order and the final summary
+ * is printed after the last round, without ever stalling audio ingest.
  */
 @Component
 public class AudioStreamHandler extends AbstractWebSocketHandler {
@@ -43,27 +50,32 @@ public class AudioStreamHandler extends AbstractWebSocketHandler {
     private final AudioProperties audioProperties;
     private final AudioStorage storage;
     private final TranscriptionService transcription;
+    private final ClaimAdvisor advisor;
     private final Map<String, Connection> connections = new ConcurrentHashMap<>();
     private final ExecutorService transcriptionPool = Executors.newVirtualThreadPerTaskExecutor();
 
     public AudioStreamHandler(ObjectMapper objectMapper, AudioProperties audioProperties,
-                              AudioStorage storage, TranscriptionService transcription) {
+                              AudioStorage storage, TranscriptionService transcription, ClaimAdvisor advisor) {
         this.objectMapper = objectMapper;
         this.audioProperties = audioProperties;
         this.storage = storage;
         this.transcription = transcription;
+        this.advisor = advisor;
     }
 
-    /** Per-connection wiring: thread-safe socket wrapper, serial executor, capture state. */
+    /** Per-connection wiring: thread-safe socket wrapper, serial executors, capture + case state. */
     private static final class Connection {
         final WebSocketSession socket;
-        final ExecutorService executor;
-        volatile CaptureSession capture;   // null until "start"
+        final ExecutorService executor;          // ingest + control messages
+        final ExecutorService advisorExecutor;   // transcript -> advisor rounds -> summary, in order
+        volatile CaptureSession capture;         // null until "start"
+        volatile FnolCase fnol;                  // created with the capture
         long droppedBytesBeforeStart;
 
         Connection(WebSocketSession raw) {
             this.socket = new ConcurrentWebSocketSessionDecorator(raw, 10_000, 512 * 1024);
             this.executor = Executors.newSingleThreadExecutor(Thread.ofVirtual().name("ws-" + raw.getId()).factory());
+            this.advisorExecutor = Executors.newSingleThreadExecutor(Thread.ofVirtual().name("advisor-" + raw.getId()).factory());
         }
     }
 
@@ -86,6 +98,8 @@ public class AudioStreamHandler extends AbstractWebSocketHandler {
                 log.info("[{}] socket closed without 'stop' - finalising implicitly", capture.sessionId());
                 stopCapture(conn, capture);
             }
+            // Queued advisor rounds and the summary still complete; no new work is accepted.
+            conn.advisorExecutor.shutdown();
         });
         conn.executor.shutdown();
     }
@@ -111,7 +125,7 @@ public class AudioStreamHandler extends AbstractWebSocketHandler {
                 }
                 switch (msg.type()) {
                     case ClientMessage.START -> startCapture(conn, msg);
-                    case ClientMessage.TRANSCRIBE -> requireCapture(conn, c -> cutAndTranscribe(conn, c, "transcribe command"));
+                    case ClientMessage.TRANSCRIBE -> requireCapture(conn, c -> cutAndTranscribe(conn, c, "transcribe command", true));
                     case ClientMessage.STOP -> requireCapture(conn, c -> stopCapture(conn, c));
                     default -> sendError(conn, "unknown type: " + msg.type());
                 }
@@ -166,15 +180,23 @@ public class AudioStreamHandler extends AbstractWebSocketHandler {
         Path dir = storage.createSessionDir(sessionId);
         var capture = new CaptureSession(sessionId, msg.device(), msg.language(), format, dir, storage.openRawPcm(dir));
         conn.capture = capture;
+        conn.fnol = new FnolCase(sessionId, msg.device() == null ? "unknown" : msg.device());
         if (conn.droppedBytesBeforeStart > 0) {
             log.warn("[{}] {} audio bytes arrived before 'start' and were dropped", sessionId, conn.droppedBytesBeforeStart);
         }
-        log.info("[{}] capture started: device={} language={} format={} dir={}",
-                sessionId, msg.device(), msg.language(), format, dir);
-        send(conn, event("ready", sessionId, Map.of("format", format, "transcriptionEnabled", transcription.isEnabled())));
+        log.info("[{}] capture started: device={} language={} format={} dir={} advisor={}",
+                sessionId, msg.device(), msg.language(), format, dir, advisor.isEnabled() ? "on" : "off");
+        send(conn, event("ready", sessionId, Map.of(
+                "format", format,
+                "transcriptionEnabled", transcription.isEnabled(),
+                "advisorEnabled", advisor.isEnabled())));
     }
 
-    private void cutAndTranscribe(Connection conn, CaptureSession capture, String reason) {
+    /**
+     * Cuts the pending audio into a segment, stores it, transcribes it and (unless the call
+     * is being ended) feeds the transcript to the claim advisor.
+     */
+    private void cutAndTranscribe(Connection conn, CaptureSession capture, String reason, boolean runAdvisor) {
         byte[] pcm = capture.cutSegment();
         if (pcm.length == 0) {
             log.info("[{}] {} - nothing captured since last cut", capture.sessionId(), reason);
@@ -202,25 +224,62 @@ public class AudioStreamHandler extends AbstractWebSocketHandler {
         }
         byte[] wav = WavWriter.toWav(capture.format(), pcm);
         String fileName = file.getFileName().toString();
-        String language = capture.language();
-        transcriptionPool.execute(() -> {
+        String language = capture.language() == null ? "fi" : capture.language();
+        FnolCase fnol = conn.fnol;
+
+        CompletableFuture<Optional<String>> transcript = CompletableFuture.supplyAsync(() -> {
             try {
-                transcription.transcribe(wav, fileName, language).ifPresentOrElse(text -> {
-                    log.info("[{}] TRANSCRIPT segment {} ({}): {}", capture.sessionId(), segmentNo, language == null ? "fi" : language, text);
+                Optional<String> text = transcription.transcribe(wav, fileName, language);
+                text.ifPresentOrElse(t -> {
+                    log.info("[{}] TRANSCRIPT segment {} ({}): {}", capture.sessionId(), segmentNo, language, t);
                     send(conn, event("transcript", capture.sessionId(), Map.of(
-                            "segment", segmentNo, "language", language == null ? "fi" : language, "text", text)));
+                            "segment", segmentNo, "language", language, "text", t)));
+                    if (runAdvisor && advisor.isEnabled()) {
+                        send(conn, advisorEvent(capture.sessionId(), "WORKING", "Analysoidaan...", null, segmentNo));
+                    }
                 }, () -> log.info("[{}] segment {} produced no transcript", capture.sessionId(), segmentNo));
+                return text;
             } catch (Exception e) {
                 log.error("[{}] transcription of segment {} failed: {}", capture.sessionId(), segmentNo, e.toString());
                 sendError(conn, "transcription failed for segment " + segmentNo + ": " + e.getMessage());
+                return Optional.empty();
+            }
+        }, transcriptionPool);
+
+        // Serialised per session: rounds run in segment order and the summary waits for them.
+        submitAdvisor(conn, () -> {
+            Optional<String> text = transcript.join();
+            if (text.isEmpty() || fnol == null) return;
+            if (runAdvisor && advisor.isEnabled()) {
+                runAdvisorRound(conn, fnol, segmentNo, text.get());
+            } else {
+                fnol.addTranscript(segmentNo, text.get());   // e.g. trailing audio after hang-up
             }
         });
     }
 
+    private void runAdvisorRound(Connection conn, FnolCase fnol, int segmentNo, String text) {
+        try {
+            AdvisorDecision d = advisor.advance(fnol, segmentNo, text);
+            if (d.isReady()) {
+                send(conn, advisorEvent(fnol.sessionId(), "VALMIS_KORVAUSRATKAISUUN", advisor.closingPhrase(), null, segmentNo));
+            } else {
+                send(conn, advisorEvent(fnol.sessionId(), "LISAKYSYMYKSET",
+                        "Lisäkysymyksiä: " + d.questions().size(), d.questions(), segmentNo));
+            }
+        } catch (Exception e) {
+            log.error("[{}] claim advisor round failed for segment {}: {}", fnol.sessionId(), segmentNo, e.toString(), e);
+            fnol.recordError(e.toString());
+            send(conn, advisorEvent(fnol.sessionId(), "ERROR", "Neuvoja ei vastannut", null, segmentNo));
+        }
+    }
+
     private void stopCapture(Connection conn, CaptureSession capture) {
         if (capture.stopped()) return;
+        FnolCase fnol = conn.fnol;
+        if (fnol != null) fnol.markHungUp();        // decisions arriving after this keep status KESKEN
         if (capture.pendingSegmentBytes() > 0) {
-            cutAndTranscribe(conn, capture, "stop command");
+            cutAndTranscribe(conn, capture, "stop command", false);
         }
         try {
             capture.markStopped();
@@ -235,17 +294,20 @@ public class AudioStreamHandler extends AbstractWebSocketHandler {
             log.error("[{}] failed to finalise session: {}", capture.sessionId(), e.toString());
             sendError(conn, "finalise failure: " + e.getMessage());
         }
+        if (fnol != null) {
+            submitAdvisor(conn, () -> advisor.logSummary(fnol));   // step 5, after any in-flight round
+        }
     }
 
     private void maybeAutoCut(Connection conn, CaptureSession capture) {
         int maxBytes = audioProperties.maxSegmentSeconds() * capture.format().bytesPerSecond();
         if (capture.pendingSegmentBytes() >= maxBytes) {
-            cutAndTranscribe(conn, capture, "max segment length");
+            cutAndTranscribe(conn, capture, "max segment length", true);
             return;
         }
         int auto = audioProperties.autoSegmentSeconds();
         if (auto > 0 && capture.millisSinceLastCut() >= auto * 1000L) {
-            cutAndTranscribe(conn, capture, "auto segment");
+            cutAndTranscribe(conn, capture, "auto segment", true);
         }
     }
 
@@ -264,12 +326,30 @@ public class AudioStreamHandler extends AbstractWebSocketHandler {
         action.run(capture);
     }
 
+    private void submitAdvisor(Connection conn, Runnable task) {
+        try {
+            conn.advisorExecutor.execute(task);
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            log.warn("Advisor executor already shut down for {}", conn.socket.getId());
+        }
+    }
+
     private Map<String, Object> event(String type, String sessionId, Map<String, ?> fields) {
         var map = new LinkedHashMap<String, Object>();
         map.put("type", type);
         map.put("sessionId", sessionId);
         map.putAll(fields);
         return map;
+    }
+
+    private Map<String, Object> advisorEvent(String sessionId, String status, String message,
+                                             java.util.List<String> questions, int segmentNo) {
+        var fields = new LinkedHashMap<String, Object>();
+        fields.put("status", status);
+        fields.put("message", message);
+        fields.put("segment", segmentNo);
+        if (questions != null) fields.put("questions", questions);
+        return event("advisor", sessionId, fields);
     }
 
     private void sendError(Connection conn, String message) {

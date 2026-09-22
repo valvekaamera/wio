@@ -1,43 +1,132 @@
 # tahti-fnol-transcript
 
 Spring Boot 3.5 / Java 25 / Spring AI 1.1 backend that receives 16 kHz PCM
-audio from the Wio Terminal over a WebSocket, stores it as WAV, and
-transcribes it in Finnish with a speech-to-text deployment in Azure AI
-Foundry (default `gpt-4o-mini-transcribe`; `gpt-4o-transcribe` or `whisper`
-work too, they share the `/audio/transcriptions` API). Wire contract:
-[`../docs/audio-ws-protocol.md`](../docs/audio-ws-protocol.md).
+audio from the Wio Terminal over a WebSocket, stores it as WAV, transcribes
+it in Finnish with a speech-to-text deployment in Azure AI Foundry (default
+`gpt-4o-mini-transcribe`; `gpt-4o-transcribe` or `whisper` work too, they
+share the `/audio/transcriptions` API), and runs a **claim-advisor agent**
+(`gpt-5.4` + policy tools) over the transcript to drive the FNOL intake.
+Wire contract: [`../docs/audio-ws-protocol.md`](../docs/audio-ws-protocol.md).
 
 ## Run
 
 ```bash
 export AZURE_OPENAI_API_KEY=...                              # never commit this
 export AZURE_TRANSCRIBE_DEPLOYMENT=gpt-4o-mini-transcribe    # only if your deployment name differs
+export AZURE_CHAT_DEPLOYMENT=gpt-5.4                         # only if your deployment name differs
 cd backend
 mvn spring-boot:run
 ```
 
-Deploying the model in AI Foundry: **Models + endpoints → Deploy base model →
+Listens on `ws://0.0.0.0:8090/ws/audio` (`SERVER_PORT` to change; 8080 is
+usually taken by the tahti Docker stack). Recordings land in `./recordings/`.
+The policy tools expect `tahti-rest-app` on `:8085` and `pcpc-rest-app` on
+`:8080` (see configuration).
+
+Deploying the models in AI Foundry: **Models + endpoints → Deploy base model →
 `gpt-4o-mini-transcribe` → Default settings** (Global Standard). Whisper needs a
 regional *Standard* deployment, for which new subscriptions often have zero
 quota in `swedencentral`.
 
-Listens on `ws://0.0.0.0:8090/ws/audio` (`SERVER_PORT` to change; 8080 is
-usually taken by the tahti Docker stack). Recordings land in `./recordings/`.
-
-Run without Azure (store audio only, no transcription):
+Run without Azure (store audio only, no transcription, no advisor):
 
 ```bash
-AZURE_OPENAI_API_KEY=x SPRING_AI_TRANSCRIPTION=none mvn spring-boot:run
+AZURE_OPENAI_API_KEY=x SPRING_AI_TRANSCRIPTION=none APP_ADVISOR_ENABLED=false mvn spring-boot:run
 ```
+
+## Claim-advisor loop (FNOL intake)
+
+One capture session = one call = one `FnolCase`. Every `transcribe` (Wio
+button **A**) produces a transcript segment and one advisor round:
+
+1. **Extraction** — `gpt-5.4` pulls hetu, loss date, caller and loss
+   description out of the transcript so far. The hetu is then validated in
+   Java (format + check character): STT drops digits often, and a wrong
+   hetu must produce a follow-up question, never an empty policy lookup.
+2. **Policy discovery** — once hetu and date are known the model gets the
+   tool-set and walks *insurables → coverages → risks / claim types →
+   terms* for the caller, matching the described loss to every candidate
+   path (e.g. appliance as Irtaimisto vs. fixture of Huoneisto,
+   Rikkoutuminen vs. Putkivuoto).
+3. **VALMIS_KORVAUSRATKAISUUN** — identity, loss and policy match are
+   unambiguous. The log shows the decision proposal and
+   `=> Sano asiakkaalle: "Kiitos, otamme teihin pian yhteyttä." ja lopeta puhelu (B)`;
+   the Wio shows the same in green.
+4. **LISAKYSYMYKSET** — something essential is missing or two paths remain.
+   The log prints the transcript so far and the numbered questions; the Wio
+   shows the count and the first question. The handler asks, presses **A**,
+   and the next round continues the same conversation (history + tool
+   results carry over).
+5. **Summary** — on `stop` (button **B**, any time) the `FNOL-YHTEENVETO`
+   block is logged: status `VALMIS KORVAUSRATKAISUUN` if a decision was
+   reached before hang-up, otherwise `KESKEN`; caller, hetu, loss date,
+   matched policy path, decision, questions asked, running summary and the
+   full transcript.
+
+Design principle: the model brings generic claims-intake competence; every
+proprietary fact (which coverages, risks, claim types, terms, deductibles
+exist) comes from tool results at runtime; the system prompt is the
+protocol between them. The prompt lives in `agent/ClaimAdvisor.java`.
+
+### Tool-set
+
+Same names and arguments as the tahti MCP server, so the prompt is
+portable (`agent/tools/`). Exposed as one `ToolCallbackProvider` bean —
+adding `spring-ai-starter-mcp-server-webmvc` would publish it to remote MCP
+clients unchanged.
+
+| Tool | Source |
+| --- | --- |
+| `getInsurablesByPolicyholderHetu(hetu, targetdate)` | `/tahti-data/valid_insurables_policyholder/hetu/{hetu}/targetdate/{d}/option/both` |
+| `getCoveragesByInsurableOid(oid, targetdate)` | `/tahti-data/valid_coverages_insurable/{oid}/targetdate/{d}/option/both` |
+| `getRisksByCoverageOid(oid, targetdate)` | `/tahti-data/valid_risks_coverage/{oid}/targetdate/{d}/option/both` |
+| `getEcoveragesByCoverageOid(oid, targetdate)` | `/tahti-data/valid_ecoverages_coverage/{oid}/targetdate/{d}/option/both` |
+| `getConstraintTermsByParentOid(oid, targetdate)` | `/tahti-data/valid_terms_parent/{oid}/targetdate/{d}/option/both` |
+| `getGeneralTermsByParentOid(oid, targetdate)` | `/tahti-data/valid_gen_terms_parent/{oid}/targetdate/{d}` |
+| `getEntityTypesByIds(ids)` | pcpc `/branch/{branch}/entities`, cached, sliced by id |
+| `searchEntityTypesByName(query, limit)` | same cache, Finnish name search |
+
+Policy responses are compacted before they reach the model (transient and
+`*PreviousValue` attributes, session OIDs and pricing intermediates are
+dropped; ~50 % smaller) and every `Type` code is enriched with its Finnish
+`TypeName` from the ontology cache, so the model rarely needs the ontology
+tools at all. The ~0.5 MB entity catalogue is fetched once and cached for
+`app.pcpc.cache-ttl`.
+
+### Text-only entry (replay / other adapters)
+
+```bash
+curl -s -X POST localhost:8090/api/fnol/demo1/segments -H 'Content-Type: application/json' \
+  -d '{"text":"Tervehdys, olen Ville, hetuni on 090798-921E. Pesukone meni rikki 13.9.2026 ..."}'
+curl -s -X POST localhost:8090/api/fnol/demo1/hangup
+```
+
+Runs exactly the same rounds as the Wio path, minus audio — handy for
+tuning the prompt against stored transcripts.
 
 ## What you see in the log
 
 ```
-[wio-1a2b3c4d-0001] capture started: device=wio-terminal language=fi format=PcmFormat[...] dir=recordings/20260918-150501-wio-1a2b3c4d-0001
+[wio-1a2b3c4d-0001] capture started: device=wio-terminal language=fi ... advisor=on
 [wio-1a2b3c4d-0001] segment 1 stored (4812 ms, 153984 bytes, transcribe command) -> recordings/.../segment-001.wav
-Transcription of segment-001.wav done in 1830 ms
-[wio-1a2b3c4d-0001] TRANSCRIPT segment 1 (fi): Hei, haluaisin ilmoittaa autovahingosta.
-[wio-1a2b3c4d-0001] capture stopped: 1 segments, 9130 ms total -> recordings/.../session.wav
+[wio-1a2b3c4d-0001] TRANSCRIPT segment 1 (fi): Tervehdys, olen Ville ja hetuni on 09078-921E ...
+[wio-1a2b3c4d-0001] extraction: hetu=09078-921E (muoto virheellinen ...), lossDate=2026-09-13, caller=Ville, loss=Pesukone rikkoutui ...
+[wio-1a2b3c4d-0001] ---- KIERROS 1 (6 s) -> LISAKYSYMYKSET
+Transkriptio tähän mennessä:
+  [1] ...
+LISÄKYSYMYKSET - kysy asiakkaalta, sitten paina A:
+  1. Voisitteko toistaa henkilötunnuksenne numero kerrallaan?
+[tool] getInsurablesByPolicyholderHetu(090798-921E, 2026-09-13) -> 1319 chars in 1137 ms
+[tool] getCoveragesByInsurableOid(34CC3A72..., 2026-09-13) -> 686 chars in 143 ms
+...
+[wio-1a2b3c4d-0001] ---- KIERROS 2 (21 s) -> VALMIS_KORVAUSRATKAISUUN
+Vakuutus:
+  - VARASTOTIE 1, VANTAA, Irtaimisto / Irtaimiston Tähtiturva / Rikkoutuminen / Esinevahinko  (991-1870594-001)  omavastuu 200.0  ehdot KO300, YL100
+KORVAUSRATKAISU: KORVATTAVA - ...
+=> Sano asiakkaalle: "Kiitos, otamme teihin pian yhteyttä." ja lopeta puhelu (B).
+[wio-1a2b3c4d-0001] ================= FNOL-YHTEENVETO =================
+Tila: VALMIS KORVAUSRATKAISUUN
+...
 ```
 
 ## Configuration
@@ -50,22 +139,40 @@ Transcription of segment-001.wav done in 1830 ms
 | `app.audio.min-transcribe-millis` | `400` | Shorter segments are stored but not sent to the model |
 | `app.transcription.language` | `fi` | Forced transcription language (avoids auto-detect drift) |
 | `app.transcription.prompt` | insurance vocabulary | Bias prompt for domain terms, Finnish place names and the henkilötunnus format |
-| `spring.ai.azure.openai.audio.transcription.options.deployment-name` | `gpt-4o-mini-transcribe` | Speech-to-text deployment in AI Foundry (`AZURE_TRANSCRIBE_DEPLOYMENT`) |
+| `spring.ai.azure.openai.audio.transcription.options.deployment-name` | `gpt-4o-mini-transcribe` | Speech-to-text deployment (`AZURE_TRANSCRIBE_DEPLOYMENT`) |
+| `spring.ai.azure.openai.chat.options.deployment-name` | `gpt-5.4` | Advisor model (`AZURE_CHAT_DEPLOYMENT`) |
+| `app.tahti.base-url` | `http://localhost:8085/tahti-rest-app` | Policy data REST (`TAHTI_REST_URL`); `/tahti-data/...` appended |
+| `app.pcpc.base-url` | `http://localhost:8080/pcpc-rest-app` | Ontology REST (`PCPC_REST_URL`) |
+| `app.pcpc.branch` | `tahti4devTEST20260921` | Product-model branch (`PCPC_BRANCH`) |
+| `app.pcpc.cache-ttl` | `1h` | Entity catalogue cache lifetime |
+| `app.advisor.enabled` | `true` | Run the advisor after each transcript (`APP_ADVISOR_ENABLED`) |
+| `app.advisor.closing-phrase` | `Kiitos, otamme teihin pian yhteyttä.` | Said when a decision is ready |
+| `app.advisor.reasoning-effort` | *(blank)* | gpt-5 `reasoning_effort` for the tool round (`APP_ADVISOR_REASONING`), e.g. `medium` |
+| `app.advisor.extraction-reasoning-effort` | *(blank)* | same for the extraction call (`APP_ADVISOR_EXTRACTION_REASONING`), e.g. `low` |
+| `app.advisor.max-questions-per-round` | `4` | Cap on follow-up questions per round |
 
-Azure note: Spring AI uses the classic Azure OpenAI audio API
+Azure note: Spring AI uses the classic Azure OpenAI API
 (`<resource>.cognitiveservices.azure.com`), which is the surface that
 supports transcription; the newer Foundry `/openai/v1` endpoint does not yet.
 
 ## Design
 
-- `ws/AudioStreamHandler` – one connection = one session; all per-session
-  work is serialised on a virtual thread owned by that session, transcription
-  calls run on further virtual threads so ingest never blocks.
+- `ws/AudioStreamHandler` – one connection = one session; ingest runs on a
+  virtual thread owned by that session, transcription on a shared pool,
+  and advisor rounds on a second per-session serial executor so rounds stay
+  in segment order and the summary prints after the last one.
 - `audio/CaptureSession` – in-memory current segment + streaming raw PCM
   file for the full call; `AudioStorage`/`WavWriter` produce the WAV files.
 - `transcription/TranscriptionService` – wraps
   `AzureOpenAiAudioTranscriptionModel`; degrades to store-only if the model
   bean is absent.
+- `agent/ClaimAdvisor` – the loop above; `FnolCase` holds transcript,
+  chat history, validated hetu/date, rounds and status; `Hetu` validates
+  the identity code; `AdvisorDecision` is the structured round output.
+- `policy/TahtiPolicyClient`, `policy/InsuranceOntology` – REST access and
+  response compaction / caching; `agent/tools/*` – the `@Tool` facade.
+- `api/FnolTextController` – text-only entry to the same loop.
 
-Later phase: feed the transcript to the `gpt-5.4` chat deployment with MCP
-tools to extract structured FNOL data.
+Privacy: transcripts, hetus and the summary are logged in clear and WAVs are
+kept indefinitely under `recordings/`. Fine for the dev branch with test
+persons; mask the log and add retention before real callers.

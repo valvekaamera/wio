@@ -6,21 +6,31 @@ On boot it shows **Waiting for FNOL** on the LCD, opens USB serial at
 `reboot`, `ping`, plus the `wifi ...` commands described below. The three top
 buttons emulate a phone call (FNOL = First Notice Of Loss).
 
-## Audio capture and transcription
+## Audio capture, transcription and claim-advisor loop
 
 ```
 Wio Terminal                         backend/ (Spring Boot, Java 25)            Azure AI Foundry
 mic -> ADC1 16 kHz ---ring buffer--> WebSocket ws://host:8090/ws/audio  -->   gpt-4o-mini-transcribe (fi)
-buttons C / A / B                    stores recordings/<session>/*.wav          transcript -> log
+buttons C / A / B                    stores recordings/<session>/*.wav          transcript
+                                     claim advisor (FnolCase)             <-->  gpt-5.4 + policy tools
+                                       tools -> tahti-rest-app / pcpc-rest-app  (insurables, coverages, risks,
+                                     LISÄKYSYMYKSET / KORVAUSRATKAISU -> log     claim types, terms, ontology)
 ```
 
 - **C** starts a session: connects to the backend, sends `start`, then
   streams 16-bit PCM in 64 ms frames while the red **rec** screen runs.
 - **A** sends `transcribe`: the backend cuts the audio received so far into
-  `segment-NNN.wav` and sends it to the transcription deployment; the Finnish text
-  is logged on the server and echoed back to the Wio, which shows it under
-  the timer.
-- **B** sends `stop`: the backend writes `session.wav` and closes.
+  `segment-NNN.wav`, transcribes it, and runs one **claim-advisor round**:
+  hetu + loss date are extracted and validated, the caller's policy is
+  discovered through the tool-set, and the verdict comes back to the Wio:
+  - **LISÄKYSYMYKSIÄ: N** — the follow-up questions are in the server log
+    (with the transcript so far); the first one is shown on the LCD. Ask
+    the caller, then press **A** again — the answers join the same case.
+  - **KORVAUSRATKAISU VALMIS** — say *"Kiitos, otamme teihin pian
+    yhteyttä."* and press **B**.
+- **B** sends `stop`: the backend writes `session.wav` and prints the
+  **FNOL-YHTEENVETO** with status `VALMIS KORVAUSRATKAISUUN` or `KESKEN`
+  (hanging up at any time yields `KESKEN`).
 
 The wire contract is in [`docs/audio-ws-protocol.md`](docs/audio-ws-protocol.md);
 backend setup and configuration in [`backend/README.md`](backend/README.md).
@@ -43,9 +53,9 @@ level bar moves when you speak and inspect `segment-001.wav` on the server.
 
 | Button | Action | Screen |
 | --- | --- | --- |
-| **C** (left) | Pick up the phone; start mic capture and WebSocket session | Red **rec** with elapsed `mm:ss`, level bar, backend status, last transcript |
-| **B** (middle) | Hang up; send `stop`, close session | **Hang up** for 2 s, then back to **Waiting for FNOL** |
-| **A** (right) | Send `transcribe` to the backend | **Sending FNOL to transcription** for 5 s, then back to the previous screen |
+| **C** (left) | Pick up the phone; start mic capture and WebSocket session | Red **rec** with elapsed `mm:ss`, level bar, backend status, last transcript / advisor verdict |
+| **B** (middle) | Hang up; send `stop`, close session; server prints the FNOL summary | **Hang up** for 2 s, then back to **Waiting for FNOL** |
+| **A** (right) | Send `transcribe` to the backend (transcription + one advisor round) | **Sending FNOL to transcription** for 5 s, then back to **rec**; `Analysoidaan FNOL...` until the verdict arrives |
 
 Rules: C only works while idle, B only while recording. A works from idle or
 recording; after the 5 s overlay it returns to where it came from, so a call

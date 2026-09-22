@@ -46,6 +46,11 @@ constexpr int kTranscriptLines = 3;
 constexpr int kTranscriptCols = 52;               // 320 px / 6 px per char at size 1
 String lastTranscript;                            // ASCII-folded for the LCD
 bool transcriptDirty = false;
+// Claim-advisor verdict for the latest segment; headline replaces the first transcript
+// line, detail (closing phrase or first follow-up question) replaces the transcript tail.
+String advisorHeadline;
+String advisorDetail;
+uint16_t advisorColor = TFT_WHITE;
 const char* wifiStatusName(int status);
 
 struct Button {
@@ -151,21 +156,21 @@ void drawRecordingStatus() {
   tft.drawString(line, 10, kRecStatusY);
   tft.setTextPadding(0);
 }
-void drawRecordingTranscript() {
-  tft.fillRect(0, kRecTranscriptY, tft.width(), bodyTop() + bodyHeight() - kRecTranscriptY, kBgColor);
-  if (lastTranscript.length() == 0) return;
+// Word-wrap `text` into at most `maxLines` lines of kTranscriptCols and draw them at `y`,
+// keeping the tail when it does not fit (the end of a sentence carries the news).
+void drawWrappedTail(const String& text, int y, int maxLines, uint16_t color) {
+  if (text.length() == 0 || maxLines <= 0) return;
   tft.setTextDatum(TL_DATUM);
   tft.setTextSize(1);
-  tft.setTextColor(kTextColor, kBgColor);
-  // Show the tail of the transcript, word-wrapped into up to kTranscriptLines lines.
+  tft.setTextColor(color, kBgColor);
   String lines[kTranscriptLines];
   int count = 0;
   String current;
   int start = 0;
-  while (start <= static_cast<int>(lastTranscript.length())) {
-    int end = lastTranscript.indexOf(' ', start);
-    if (end < 0) end = lastTranscript.length();
-    String word = lastTranscript.substring(start, end);
+  while (start <= static_cast<int>(text.length())) {
+    int end = text.indexOf(' ', start);
+    if (end < 0) end = text.length();
+    String word = text.substring(start, end);
     if (current.length() + word.length() + 1 > kTranscriptCols && current.length() > 0) {
       lines[count % kTranscriptLines] = current;
       count++;
@@ -177,10 +182,28 @@ void drawRecordingTranscript() {
   }
   lines[count % kTranscriptLines] = current;
   count++;
-  const int shown = count < kTranscriptLines ? count : kTranscriptLines;
+  const int shown = count < maxLines ? count : maxLines;
   for (int i = 0; i < shown; ++i) {
     const String& l = lines[(count - shown + i) % kTranscriptLines];
-    tft.drawString(l, 10, kRecTranscriptY + i * 12);
+    tft.drawString(l, 10, y + i * 12);
+  }
+}
+void drawRecordingTranscript() {
+  tft.fillRect(0, kRecTranscriptY, tft.width(), bodyTop() + bodyHeight() - kRecTranscriptY, kBgColor);
+  int y = kRecTranscriptY;
+  int linesLeft = kTranscriptLines + 1;   // 4 x 12 px fit between y=148 and the footer
+  if (advisorHeadline.length() > 0) {
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextSize(1);
+    tft.setTextColor(advisorColor, kBgColor);
+    tft.drawString(advisorHeadline, 10, y);
+    y += 12;
+    linesLeft--;
+  }
+  if (advisorDetail.length() > 0) {
+    drawWrappedTail(advisorDetail, y, linesLeft, kTextColor);
+  } else {
+    drawWrappedTail(lastTranscript, y, linesLeft, kTextColor);
   }
 }
 void drawRecordingBody() {
@@ -293,6 +316,8 @@ void enterState(CallState next) {
       break;
     case CallState::Recording:
       lastTranscript = "";
+      advisorHeadline = "";
+      advisorDetail = "";
       ensureWifiConnected();
       mic::start();
       stream::startSession();
@@ -323,6 +348,35 @@ void enterState(CallState next) {
 void onTranscriptReceived(int segment, const char* text) {
   (void)segment;
   lastTranscript = asciiFold(text);
+  // A new segment starts a new advisor round; the "WORKING" event follows right after.
+  advisorHeadline = "";
+  advisorDetail = "";
+  transcriptDirty = true;
+}
+void onAdvisorReceived(stream::AdvisorStatus status, const char* message, int questionCount,
+                       const char* firstQuestion) {
+  switch (status) {
+    case stream::AdvisorStatus::Working:
+      advisorHeadline = "Analysoidaan FNOL...";
+      advisorDetail = "";                       // keep showing the transcript meanwhile
+      advisorColor = TFT_ORANGE;
+      break;
+    case stream::AdvisorStatus::Ready:
+      advisorHeadline = "KORVAUSRATKAISU VALMIS  ->  B: hang up";
+      advisorDetail = String("Sano: \"") + asciiFold(message) + "\"";
+      advisorColor = TFT_GREEN;
+      break;
+    case stream::AdvisorStatus::Questions:
+      advisorHeadline = "LISAKYSYMYKSIA: " + String(questionCount) + "  (kaikki palvelinlokissa)";
+      advisorDetail = String("1. ") + asciiFold(firstQuestion);
+      advisorColor = TFT_ORANGE;
+      break;
+    case stream::AdvisorStatus::Error:
+      advisorHeadline = "Neuvoja ei vastannut";
+      advisorDetail = asciiFold(message);
+      advisorColor = TFT_RED;
+      break;
+  }
   transcriptDirty = true;
 }
 void onStreamStatus(stream::State state) {
@@ -666,6 +720,7 @@ void setup() {
   stream::begin(BACKEND_HOST, BACKEND_PORT, BACKEND_WS_PATH, DEVICE_NAME, TRANSCRIPTION_LANGUAGE);
   stream::onTranscript(onTranscriptReceived);
   stream::onStatus(onStreamStatus);
+  stream::onAdvisor(onAdvisorReceived);
 
   // Kick off Wi-Fi in the background so the first call does not have to wait for it.
   if (strlen(WIFI_SSID) > 0) {

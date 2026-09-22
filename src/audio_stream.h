@@ -12,12 +12,18 @@ namespace stream {
 
 enum class State { Idle, Connecting, Streaming, Stopping };
 
+// Claim-advisor verdict for the latest segment (server event "advisor").
+enum class AdvisorStatus { Working, Ready, Questions, Error };
+
 using TranscriptCallback = void (*)(int segment, const char* text);
 using StatusCallback = void (*)(State state);
+// message: closing phrase / short headline; firstQuestion: first "lisäkysymys" or "" (all are on serial + server log)
+using AdvisorCallback = void (*)(AdvisorStatus status, const char* message, int questionCount, const char* firstQuestion);
 
 void begin(const char* host, uint16_t port, const char* path, const char* device, const char* language);
 void onTranscript(TranscriptCallback cb);
 void onStatus(StatusCallback cb);
+void onAdvisor(AdvisorCallback cb);
 
 void startSession();
 void requestTranscribe();
