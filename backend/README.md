@@ -39,29 +39,48 @@ AZURE_OPENAI_API_KEY=x SPRING_AI_TRANSCRIPTION=none APP_ADVISOR_ENABLED=false mv
 One capture session = one call = one `FnolCase`. Every `transcribe` (Wio
 button **A**) produces a transcript segment and one advisor round:
 
-1. **Extraction** — `gpt-5.4` pulls hetu, loss date, caller and loss
-   description out of the transcript so far. The hetu is then validated in
-   Java (format + check character): STT drops digits often, and a wrong
-   hetu must produce a follow-up question, never an empty policy lookup.
+1. **Extraction** — every round `gpt-5.4` re-reads the whole transcript and
+   pulls out hetu, loss date (with the words that state it), caller and
+   loss description. Java then validates: the hetu by format + check
+   character (STT drops digits often), the loss date only if its evidence
+   phrase really occurs in the transcript — so "tänään"/"eilen" work, but a
+   silently assumed "today" is rejected.
 2. **Policy discovery** — once hetu and date are known the model gets the
    tool-set and walks *insurables → coverages → risks / claim types →
    terms* for the caller, matching the described loss to every candidate
    path (e.g. appliance as Irtaimisto vs. fixture of Huoneisto,
-   Rikkoutuminen vs. Putkivuoto).
-3. **VALMIS_KORVAUSRATKAISUUN** — identity, loss and policy match are
-   unambiguous. The log shows the decision proposal and
-   `=> Sano asiakkaalle: "Kiitos, otamme teihin pian yhteyttä." ja lopeta puhelu (B)`;
-   the Wio shows the same in green.
+   Rikkoutuminen vs. Putkivuoto). The tools are pinned to the validated
+   hetu and date of the current call, and record every element they
+   return in that call's `FnolCase`.
+3. **Call can end** — the model answers `PUHELU_VALMIS` with an outcome
+   (`KORVATTAVA` / `OSITTAIN_KORVATTAVA` / `EI_KORVATTAVA`) and a list of
+   proof the caller still has to send (`lisaselvitykset`). Java derives
+   the case status from that:
+
+   | Outcome | Pending proof | Verdict / case status |
+   | --- | --- | --- |
+   | `KORVATTAVA`, `OSITTAIN_KORVATTAVA` | none | `VALMIS_KORVAUSRATKAISUUN` → **VALMIS KORVAUSRATKAISUUN** |
+   | `EI_KORVATTAVA` | none | `EI_KORVATTAVA` → **EI KORVATTAVA** |
+   | any | yes (or next steps ask for documents) | `ODOTTAA_LISASELVITYKSIA` → **KESKEN** |
+
+   In all three the log shows `=> Sano asiakkaalle: "Kiitos, otamme teihin
+   pian yhteyttä." ja lopeta puhelu (B)` and the Wio shows the verdict.
 4. **LISAKYSYMYKSET** — something essential is missing or two paths remain.
-   The log prints the transcript so far and the numbered questions; the Wio
-   shows the count and the first question. The handler asks, presses **A**,
-   and the next round continues the same conversation (history + tool
-   results carry over).
+   A missing hetu or loss date always forces this, with the question added
+   if the model forgot it. The log prints the transcript so far and the
+   numbered questions; the Wio shows the count and the first question. The
+   handler asks, presses **A**, and the next round continues the same
+   conversation.
 5. **Summary** — on `stop` (button **B**, any time) the `FNOL-YHTEENVETO`
-   block is logged: status `VALMIS KORVAUSRATKAISUUN` if a decision was
-   reached before hang-up, otherwise `KESKEN`; caller, hetu, loss date,
-   matched policy path, decision, questions asked, running summary and the
-   full transcript.
+   block is logged with the status derived before hang-up (hanging up
+   earlier leaves `KESKEN`), caller, hetu, loss date, matched policy path
+   with *Vakuutusnumero, Vakuutusmäärä, Vakuutusmäärän peruste, Omavastuu,
+   Omavastuutyyppi, Ehdot* (read from the tool results, claim type before
+   risk before coverage; `*` marks a value only the model reported),
+   decision proposal, pending proof, questions asked and the transcript.
+   The case is then disposed: its LLM conversation and cached policy data
+   are dropped, and each round logs how many earlier messages it sees
+   (always 0 in round 1).
 
 Design principle: the model brings generic claims-intake competence; every
 proprietary fact (which coverages, risks, claim types, terms, deductibles
@@ -110,22 +129,26 @@ tuning the prompt against stored transcripts.
 [wio-1a2b3c4d-0001] capture started: device=wio-terminal language=fi ... advisor=on
 [wio-1a2b3c4d-0001] segment 1 stored (4812 ms, 153984 bytes, transcribe command) -> recordings/.../segment-001.wav
 [wio-1a2b3c4d-0001] TRANSCRIPT segment 1 (fi): Tervehdys, olen Ville ja hetuni on 09078-921E ...
-[wio-1a2b3c4d-0001] extraction: hetu=09078-921E (muoto virheellinen ...), lossDate=2026-09-13, caller=Ville, loss=Pesukone rikkoutui ...
-[wio-1a2b3c4d-0001] ---- KIERROS 1 (6 s) -> LISAKYSYMYKSET
+[wio-1a2b3c4d-0001] advisor round 1 starts: 0 earlier messages, 0 policy elements known in this call
+[wio-1a2b3c4d-0001] extraction: hetu=09078-921E (muoto virheellinen ...), lossDate=2026-09-13 (evidence: '13.09.2026'), caller=Ville, loss=Pesukone rikkoutui ...
+[wio-1a2b3c4d-0001] ---- KIERROS 1 (6 s) -> LISAKYSYMYKSET   tila: KESKEN (lisäkysymyksiä avoinna)
 Transkriptio tähän mennessä:
   [1] ...
 LISÄKYSYMYKSET - kysy asiakkaalta, sitten paina A:
   1. Voisitteko toistaa henkilötunnuksenne numero kerrallaan?
-[tool] getInsurablesByPolicyholderHetu(090798-921E, 2026-09-13) -> 1319 chars in 1137 ms
-[tool] getCoveragesByInsurableOid(34CC3A72..., 2026-09-13) -> 686 chars in 143 ms
+[wio-1a2b3c4d-0001] advisor round 2 starts: 2 earlier messages, 0 policy elements known in this call
+[wio-1a2b3c4d-0001] [tool] getInsurablesByPolicyholderHetu(090798-921E, 2026-09-13) -> 2 items, 1319 chars in 1137 ms
+[wio-1a2b3c4d-0001] [tool] getCoveragesByInsurableOid(34CC3A72..., 2026-09-13) -> 1 items, 686 chars in 143 ms
 ...
-[wio-1a2b3c4d-0001] ---- KIERROS 2 (21 s) -> VALMIS_KORVAUSRATKAISUUN
+[wio-1a2b3c4d-0001] ---- KIERROS 2 (21 s) -> VALMIS_KORVAUSRATKAISUUN   tila: VALMIS KORVAUSRATKAISUUN (korvausratkaisu voidaan tehdä)
 Vakuutus:
-  - VARASTOTIE 1, VANTAA, Irtaimisto / Irtaimiston Tähtiturva / Rikkoutuminen / Esinevahinko  (991-1870594-001)  omavastuu 200.0  ehdot KO300, YL100
-KORVAUSRATKAISU: KORVATTAVA - ...
+  - VARASTOTIE 1, VANTAA, Irtaimisto / Irtaimiston Tähtiturva / Rikkoutuminen / Esinevahinko
+      Vakuutusnumero 991-1870594-001 | Vakuutusmäärä 4390.51 € | Vakuutusmäärän peruste Täysarvo
+      Omavastuu 200.00 € | Omavastuutyyppi Kiinteä | Ehdot KO300, YL100
+Korvausratkaisuehdotus: KORVATTAVA - ...
 => Sano asiakkaalle: "Kiitos, otamme teihin pian yhteyttä." ja lopeta puhelu (B).
 [wio-1a2b3c4d-0001] ================= FNOL-YHTEENVETO =================
-Tila: VALMIS KORVAUSRATKAISUUN
+Tila: VALMIS KORVAUSRATKAISUUN (korvausratkaisu voidaan tehdä)
 ...
 ```
 

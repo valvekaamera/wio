@@ -49,27 +49,27 @@ public class TahtiPolicyClient {
         this.mapper = mapper;
     }
 
-    public String insurablesByPolicyholderHetu(String hetu, String targetDate) {
+    public JsonNode insurablesByPolicyholderHetu(String hetu, String targetDate) {
         return elements("/valid_insurables_policyholder/hetu/{hetu}/targetdate/{date}/option/both", hetu, targetDate);
     }
 
-    public String coveragesByInsurable(String insurableOid, String targetDate) {
+    public JsonNode coveragesByInsurable(String insurableOid, String targetDate) {
         return elements("/valid_coverages_insurable/{oid}/targetdate/{date}/option/both", insurableOid, targetDate);
     }
 
-    public String risksByCoverage(String coverageOid, String targetDate) {
+    public JsonNode risksByCoverage(String coverageOid, String targetDate) {
         return elements("/valid_risks_coverage/{oid}/targetdate/{date}/option/both", coverageOid, targetDate);
     }
 
-    public String ecoveragesByCoverage(String coverageOid, String targetDate) {
+    public JsonNode ecoveragesByCoverage(String coverageOid, String targetDate) {
         return elements("/valid_ecoverages_coverage/{oid}/targetdate/{date}/option/both", coverageOid, targetDate);
     }
 
-    public String constraintTermsByParent(String parentOid, String targetDate) {
+    public JsonNode constraintTermsByParent(String parentOid, String targetDate) {
         return elements("/valid_terms_parent/{oid}/targetdate/{date}/option/both", parentOid, targetDate);
     }
 
-    public String generalTermsByParent(String parentOid, String targetDate) {
+    public JsonNode generalTermsByParent(String parentOid, String targetDate) {
         JsonNode root = get("/valid_gen_terms_parent/{oid}/targetdate/{date}", parentOid, targetDate);
         ArrayNode out = mapper.createArrayNode();
         for (JsonNode t : root.path("terms")) {
@@ -83,7 +83,7 @@ public class TahtiPolicyClient {
 
     // ---------------------------------------------------------------- internals
 
-    private String elements(String pathTemplate, String oidOrHetu, String targetDate) {
+    private JsonNode elements(String pathTemplate, String oidOrHetu, String targetDate) {
         JsonNode root = get(pathTemplate, oidOrHetu, targetDate);
         ArrayNode out = mapper.createArrayNode();
         for (JsonNode el : root.path("elements")) {
@@ -136,12 +136,16 @@ public class TahtiPolicyClient {
         }
     }
 
-    private String wrap(String field, ArrayNode items) {
+    private JsonNode wrap(String field, ArrayNode items) {
         ObjectNode root = mapper.createObjectNode();
         root.put("count", items.size());
         root.set(field, items);
+        return root;
+    }
+
+    public String toJson(JsonNode node) {
         try {
-            return mapper.writeValueAsString(root);
+            return mapper.writeValueAsString(node);
         } catch (Exception e) {
             throw new IllegalStateException(e);
         }

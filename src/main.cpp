@@ -362,9 +362,19 @@ void onAdvisorReceived(stream::AdvisorStatus status, const char* message, int qu
       advisorColor = TFT_ORANGE;
       break;
     case stream::AdvisorStatus::Ready:
-      advisorHeadline = "KORVAUSRATKAISU VALMIS  ->  B: hang up";
+      advisorHeadline = "VALMIS KORVAUSRATKAISUUN  ->  B: hang up";
       advisorDetail = String("Sano: \"") + asciiFold(message) + "\"";
       advisorColor = TFT_GREEN;
+      break;
+    case stream::AdvisorStatus::NotCovered:
+      advisorHeadline = "EI KORVATTAVA  ->  B: hang up";
+      advisorDetail = String("Sano: \"") + asciiFold(message) + "\"";
+      advisorColor = TFT_RED;
+      break;
+    case stream::AdvisorStatus::AwaitingEvidence:
+      advisorHeadline = "KESKEN - odottaa lisaselvityksia  ->  B";
+      advisorDetail = String("Sano: \"") + asciiFold(message) + "\"";
+      advisorColor = TFT_YELLOW;
       break;
     case stream::AdvisorStatus::Questions:
       advisorHeadline = "LISAKYSYMYKSIA: " + String(questionCount) + "  (kaikki palvelinlokissa)";

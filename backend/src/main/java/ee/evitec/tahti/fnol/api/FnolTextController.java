@@ -26,9 +26,11 @@ import org.springframework.web.bind.annotation.RestController;
  * already has text):
  * <pre>
  * POST   /api/fnol/{caseId}/segments   {"text": "..."}   -> one advisor round, returns the decision
- * POST   /api/fnol/{caseId}/hangup                       -> logs the FNOL summary (status KESKEN/VALMIS)
- * DELETE /api/fnol/{caseId}                              -> forget the case
+ * POST   /api/fnol/{caseId}/hangup                       -> logs the FNOL summary and ends the case
+ * DELETE /api/fnol/{caseId}                              -> forget the case without a summary
  * </pre>
+ * Hang-up removes the case, so posting to the same caseId afterwards starts a new call
+ * with an empty conversation.
  */
 @RestController
 @RequestMapping("/api/fnol")
@@ -37,11 +39,12 @@ public class FnolTextController {
 
     public record SegmentRequest(@NotBlank String text) {}
 
-    public record SegmentResponse(String caseId, int segment, int round, FnolCase.Status caseStatus,
-                                  AdvisorDecision decision, String sayToClient) {}
+    public record SegmentResponse(String caseId, int segment, int round, ClaimAdvisor.Verdict verdict,
+                                  FnolCase.Status caseStatus, String statusNote, AdvisorDecision decision,
+                                  String sayToClient) {}
 
-    public record HangupResponse(String caseId, FnolCase.Status status, int segments, int rounds,
-                                 List<String> questionsAsked) {}
+    public record HangupResponse(String caseId, FnolCase.Status status, String statusNote, int segments,
+                                 int rounds, List<String> questionsAsked) {}
 
     private static final Logger log = LoggerFactory.getLogger(FnolTextController.class);
 
@@ -59,14 +62,15 @@ public class FnolTextController {
         }
         FnolCase c = cases.computeIfAbsent(caseId, id -> new FnolCase(id, "text-api"));
         synchronized (c) {
-            if (c.hungUp()) {
-                return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", "case already hung up"));
+            if (c.disposed()) {
+                return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", "case ended, retry to start a new one"));
             }
             int segmentNo = c.transcripts().size() + 1;
             try {
-                AdvisorDecision d = advisor.advance(c, segmentNo, body.text());
-                String say = d.isReady() ? advisor.closingPhrase() : String.join(" ", d.questions());
-                return ResponseEntity.ok(new SegmentResponse(caseId, segmentNo, c.rounds().size(), c.status(), d, say));
+                ClaimAdvisor.RoundResult r = advisor.advance(c, segmentNo, body.text());
+                String say = r.verdict().endCall() ? advisor.closingPhrase() : String.join(" ", r.decision().questions());
+                return ResponseEntity.ok(new SegmentResponse(caseId, segmentNo, c.rounds().size(), r.verdict(),
+                        c.status(), c.statusNote(), r.decision(), say));
             } catch (RuntimeException e) {
                 log.error("[{}] advisor round failed: {}", caseId, e.toString());
                 c.recordError(e.toString());
@@ -78,18 +82,25 @@ public class FnolTextController {
 
     @PostMapping("/{caseId}/hangup")
     public ResponseEntity<?> hangup(@PathVariable String caseId) {
-        FnolCase c = cases.get(caseId);
+        FnolCase c = cases.remove(caseId);
         if (c == null) return ResponseEntity.notFound().build();
         synchronized (c) {
             c.markHungUp();
             advisor.logSummary(c);
-            return ResponseEntity.ok(new HangupResponse(caseId, c.status(), c.transcripts().size(),
-                    c.rounds().size(), c.allQuestionsAsked()));
+            var response = new HangupResponse(caseId, c.status(), c.statusNote(), c.transcripts().size(),
+                    c.rounds().size(), c.allQuestionsAsked());
+            c.dispose();
+            return ResponseEntity.ok(response);
         }
     }
 
     @DeleteMapping("/{caseId}")
     public ResponseEntity<Void> forget(@PathVariable String caseId) {
-        return cases.remove(caseId) == null ? ResponseEntity.notFound().build() : ResponseEntity.noContent().build();
+        FnolCase c = cases.remove(caseId);
+        if (c == null) return ResponseEntity.notFound().build();
+        synchronized (c) {
+            c.dispose();
+        }
+        return ResponseEntity.noContent().build();
     }
 }

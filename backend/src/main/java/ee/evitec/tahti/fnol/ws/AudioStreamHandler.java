@@ -235,7 +235,7 @@ public class AudioStreamHandler extends AbstractWebSocketHandler {
                     send(conn, event("transcript", capture.sessionId(), Map.of(
                             "segment", segmentNo, "language", language, "text", t)));
                     if (runAdvisor && advisor.isEnabled()) {
-                        send(conn, advisorEvent(capture.sessionId(), "WORKING", "Analysoidaan...", null, segmentNo));
+                        send(conn, advisorEvent(capture.sessionId(), "WORKING", "Analysoidaan...", null, segmentNo, null));
                     }
                 }, () -> log.info("[{}] segment {} produced no transcript", capture.sessionId(), segmentNo));
                 return text;
@@ -259,18 +259,22 @@ public class AudioStreamHandler extends AbstractWebSocketHandler {
     }
 
     private void runAdvisorRound(Connection conn, FnolCase fnol, int segmentNo, String text) {
+        if (fnol.disposed() || fnol.hungUp()) {
+            fnol.addTranscript(segmentNo, text);
+            return;
+        }
         try {
-            AdvisorDecision d = advisor.advance(fnol, segmentNo, text);
-            if (d.isReady()) {
-                send(conn, advisorEvent(fnol.sessionId(), "VALMIS_KORVAUSRATKAISUUN", advisor.closingPhrase(), null, segmentNo));
-            } else {
-                send(conn, advisorEvent(fnol.sessionId(), "LISAKYSYMYKSET",
-                        "Lisäkysymyksiä: " + d.questions().size(), d.questions(), segmentNo));
-            }
+            ClaimAdvisor.RoundResult r = advisor.advance(fnol, segmentNo, text);
+            AdvisorDecision d = r.decision();
+            String message = r.verdict().endCall()
+                    ? advisor.closingPhrase()
+                    : "Lisäkysymyksiä: " + d.questions().size();
+            send(conn, advisorEvent(fnol.sessionId(), r.verdict().name(), message,
+                    r.verdict().endCall() ? null : d.questions(), segmentNo, r));
         } catch (Exception e) {
             log.error("[{}] claim advisor round failed for segment {}: {}", fnol.sessionId(), segmentNo, e.toString(), e);
             fnol.recordError(e.toString());
-            send(conn, advisorEvent(fnol.sessionId(), "ERROR", "Neuvoja ei vastannut", null, segmentNo));
+            send(conn, advisorEvent(fnol.sessionId(), "ERROR", "Neuvoja ei vastannut", null, segmentNo, null));
         }
     }
 
@@ -295,7 +299,11 @@ public class AudioStreamHandler extends AbstractWebSocketHandler {
             sendError(conn, "finalise failure: " + e.getMessage());
         }
         if (fnol != null) {
-            submitAdvisor(conn, () -> advisor.logSummary(fnol));   // step 5, after any in-flight round
+            conn.fnol = null;                        // a new "start" on this socket begins a fresh case
+            submitAdvisor(conn, () -> {              // step 5, after any in-flight round
+                advisor.logSummary(fnol);
+                fnol.dispose();                      // drop LLM history + cached policy data of this call
+            });
         }
     }
 
@@ -343,11 +351,19 @@ public class AudioStreamHandler extends AbstractWebSocketHandler {
     }
 
     private Map<String, Object> advisorEvent(String sessionId, String status, String message,
-                                             java.util.List<String> questions, int segmentNo) {
+                                             java.util.List<String> questions, int segmentNo,
+                                             ClaimAdvisor.RoundResult round) {
         var fields = new LinkedHashMap<String, Object>();
         fields.put("status", status);
         fields.put("message", message);
         fields.put("segment", segmentNo);
+        if (round != null) {
+            fields.put("caseStatus", round.caseStatus().name());
+            fields.put("endCall", round.verdict().endCall());
+            if (!round.decision().pendingEvidence().isEmpty()) {
+                fields.put("pendingEvidence", round.decision().pendingEvidence());
+            }
+        }
         if (questions != null) fields.put("questions", questions);
         return event("advisor", sessionId, fields);
     }

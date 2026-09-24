@@ -110,7 +110,13 @@ void handleServerText(uint8_t* payload, size_t length) {
     stream::AdvisorStatus st = stream::AdvisorStatus::Error;
     if (strcmp(status, "WORKING") == 0) st = stream::AdvisorStatus::Working;
     else if (strcmp(status, "VALMIS_KORVAUSRATKAISUUN") == 0) st = stream::AdvisorStatus::Ready;
+    else if (strcmp(status, "EI_KORVATTAVA") == 0) st = stream::AdvisorStatus::NotCovered;
+    else if (strcmp(status, "ODOTTAA_LISASELVITYKSIA") == 0) st = stream::AdvisorStatus::AwaitingEvidence;
     else if (strcmp(status, "LISAKYSYMYKSET") == 0) st = stream::AdvisorStatus::Questions;
+    for (JsonVariantConst e : doc["pendingEvidence"].as<JsonArrayConst>()) {
+      Serial.print("  lisaselvitys: ");
+      Serial.println(e.as<const char*>());
+    }
     const char* first = count > 0 ? (questions[0] | "") : "";
     if (advisorCb) advisorCb(st, message, count, first);
   } else if (strcmp(type, "stopped") == 0) {

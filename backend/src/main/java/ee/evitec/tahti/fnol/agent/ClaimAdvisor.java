@@ -7,8 +7,14 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.regex.Pattern;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import ee.evitec.tahti.fnol.agent.AdvisorDecision.Outcome;
+import ee.evitec.tahti.fnol.agent.AdvisorDecision.PolicyMatch;
+import ee.evitec.tahti.fnol.agent.tools.TahtiPolicyTools;
 import ee.evitec.tahti.fnol.config.AdvisorProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,15 +34,19 @@ import org.springframework.stereotype.Service;
 /**
  * The claim-advisor agent loop, one {@link #advance} call per transcribed segment:
  * <ol>
- *   <li>extract hetu + loss date from the transcript (LLM), validate hetu in Java;</li>
+ *   <li>extract hetu + loss date from the whole transcript (LLM) every round; hetu is
+ *       validated in Java, a loss date is accepted only with evidence from the transcript;</li>
  *   <li>let the model discover the policy with the tool-set (insurables → coverages → risks /
- *       claim types → terms) — only once hetu and date are known;</li>
- *   <li>if the loss matches the policy unambiguously → {@code VALMIS_KORVAUSRATKAISUUN}, the
- *       handler says the closing phrase and hangs up (button B);</li>
- *   <li>otherwise → {@code LISAKYSYMYKSET}, logged with the transcript so far; the next
- *       segment (button A) feeds the answers back into the same conversation;</li>
- *   <li>{@link #logSummary} prints the call summary with status KESKEN / VALMIS.</li>
+ *       claim types → terms) — only once hetu and date are known, and pinned to them;</li>
+ *   <li>the model says whether the call can end; the case status is derived here:
+ *       {@code VALMIS_KORVAUSRATKAISUUN} (compensable, nothing pending), {@code EI_KORVATTAVA}
+ *       (not compensable, nothing pending) or {@code KESKEN} (questions open, or evidence the
+ *       caller must send after the call);</li>
+ *   <li>open questions are logged with the transcript so far; the next segment continues the
+ *       same conversation;</li>
+ *   <li>{@link #logSummary} prints the call summary; the case is then disposed.</li>
  * </ol>
+ * Each call has its own {@link FnolCase}; there is no chat memory shared between calls.
  * Messages are passed as {@link Message} objects (not {@code .user()/.system()} strings) so
  * transcript text and JSON schema braces never reach the prompt template engine.
  */
@@ -45,12 +55,21 @@ public class ClaimAdvisor {
 
     private static final Logger log = LoggerFactory.getLogger(ClaimAdvisor.class);
     private static final DateTimeFormatter FI_DATE = DateTimeFormatter.ofPattern("d.M.yyyy");
+    private static final Pattern DATE_QUESTION = Pattern.compile("(?i)(päivä|milloin|ajankohta)");
+    private static final Pattern HETU_QUESTION = Pattern.compile("(?i)(henkilötunnus|hetu)");
+    /** Safety net: next steps that wait for documents from the caller mean the case is not decided yet. */
+    private static final Pattern EVIDENCE_PENDING = Pattern.compile(
+            "(?i)((pyydä|pyydetään|toimita|toimitta|lähettä|liittä).{0,80}"
+            + "(todistu|selvity|selvitys|kuitti|kuita|lausun|ilmoitu|dokument|liite|valokuv|kuvat))"
+            + "|((selvitysten|selvityksen|todistuksen|kuitin|lausunnon|liitteiden) perusteella)");
 
     private static final String SYSTEM_PROMPT = """
             You are "Korvausneuvoja", the claim advisor of a Finnish insurer handling FNOL (first notice of \
             loss, vahinkoilmoitus) phone calls. A human claim handler is on the phone with the client and reads \
             your output; the client's speech reaches you as Finnish speech-to-text segments, one per round. \
-            Speech-to-text errors are common, especially in numbers, dates and names.
+            Speech-to-text errors are common, especially in numbers, dates and names. Every call is a separate \
+            case: you know nothing about other calls or other clients, and you refer to "earlier" information \
+            only when it appears in the messages of this conversation.
 
             Your job each round:
             1. Understand the accumulated transcript: who is calling (hetu), when the loss happened, which \
@@ -60,40 +79,70 @@ public class ClaimAdvisor {
             with the tools in this order: getInsurablesByPolicyholderHetu -> getCoveragesByInsurableOid (for \
             every insurable that could contain the damaged object) -> getRisksByCoverageOid and \
             getEcoveragesByCoverageOid (for the candidate coverages) -> getConstraintTermsByParentOid and \
-            getGeneralTermsByParentOid (for the matched insurable). Use getEntityTypesByIds or \
-            searchEntityTypesByName only for type codes that arrive without a TypeName.
+            getGeneralTermsByParentOid (for the matched insurable). Always pass the hetu and loss date given \
+            in the round input. Use getEntityTypesByIds or searchEntityTypesByName only for type codes that \
+            arrive without a TypeName.
             3. Match the loss against the policy structure: the damaged object must belong to an insurable, \
             the cause must map to a risk under a coverage that is valid (Status Voimassa) on the loss date, \
             and a claim type (Korvauslaji) must exist for that risk. Consider every candidate path, e.g. a \
             household appliance may be Irtaimisto or a fixed fixture of Huoneisto; a broken machine may be \
-            Rikkoutuminen, or Putkivuoto if water escaped and damaged the building.
+            Rikkoutuminen, or Putkivuoto if water escaped and damaged the building. In matchedPolicy copy the \
+            OIDs and the values InsuranceNumber, SumInsured, BasisForSumInsured, AmountDeductible and \
+            DeductibleType exactly as the tools returned them (claim type first, then risk, then coverage).
             4. Decide the status:
-               - VALMIS_KORVAUSRATKAISUUN when identity, loss date, object, cause and the policy match are \
-            unambiguous and the tool data supports a claim decision, positive or negative. Fill \
-            korvausratkaisu with outcome, justification (coverage, risk, terms, deductible) and next steps.
-               - LISAKYSYMYKSET otherwise. Ask only what is essential: a fact that is missing, or the single \
-            fact that separates two candidate paths. Short, plain spoken Finnish, one fact per question, \
-            never repeat a question the client already answered.
+               - PUHELU_VALMIS when everything that can be obtained by phone is collected and matched against \
+            the tool data. Fill korvausratkaisu: KORVATTAVA / OSITTAIN_KORVATTAVA / EI_KORVATTAVA with \
+            justification (coverage, risk, terms, deductible) and next steps. If the decision still depends \
+            on proof the client must send after the call (vet or doctor certificate, receipt, repair \
+            estimate, police report, photos...), list each item in lisaselvitykset - the claim is then NOT \
+            ready for decision even though the call can end. If no valid coverage responds to the loss, the \
+            outcome is EI_KORVATTAVA and lisaselvitykset stays empty.
+               - LISAKYSYMYKSET otherwise. Ask only what is essential and can be answered on the phone now: a \
+            fact that is missing, or the single fact that separates two candidate paths. Short, plain spoken \
+            Finnish, one fact per question, never repeat a question the client already answered.
 
             Rules:
             - Everything the insurer considers proprietary - which coverages, risks, claim types and terms \
             exist, deductibles, sums insured, validity - comes ONLY from tool results. Never assume product \
             structure. An empty tool result is a fact to reason about (e.g. no valid coverage on the loss date).
             - Never invent facts about the loss. If the transcript is unclear, ask.
-            - Do not call policy tools while the round input marks the hetu INVALID or missing, or the loss \
-            date missing: ask the client to repeat the hetu digit by digit, or to state the date.
-            - Keep the summary cumulative so it stands alone as the claim-file note of the whole call so far.
+            - The loss date is never assumed: if the round input says it is missing, ask when the loss \
+            happened. Do not call policy tools while the hetu is INVALID or missing, or the loss date missing.
+            - Keep the summary cumulative for this call so it stands alone as the claim-file note.
             - All free-text output in Finnish. Output exactly one JSON object as specified in the round \
             input, no prose before or after it.
             """;
 
     private static final String EXTRACTION_PROMPT = """
             You extract facts from a Finnish FNOL (vahinkoilmoitus) phone transcript produced by speech-to-text. \
+            The transcript may contain answers to follow-up questions; later statements correct earlier ones. \
             Report the hetu (henkilötunnus) exactly as heard, keeping only digits and the separator/check \
-            character (e.g. "09078-921E" stays "09078-921E" even if it looks wrong). Convert dates to \
-            yyyy-MM-dd, resolving relative expressions ("viime perjantaina", "eilen") against today's date. \
+            character (e.g. "09078-921E" stays "09078-921E" even if it looks wrong). Report the loss date only \
+            if the caller says when the loss happened - an explicit date or a relative expression ("tänään", \
+            "eilen", "viime perjantaina") resolved against today's date - and copy the words that say it into \
+            lossDateEvidence. Today's date is given only for resolving such expressions; it is never a default. \
             Never guess values that are not in the transcript; use null. Output exactly one JSON object.
             """;
+
+    /** What the claim handler should do after a round; maps 1:1 to the "advisor" event status. */
+    public enum Verdict {
+        LISAKYSYMYKSET(false),
+        VALMIS_KORVAUSRATKAISUUN(true),
+        EI_KORVATTAVA(true),
+        ODOTTAA_LISASELVITYKSIA(true);
+
+        private final boolean endCall;
+
+        Verdict(boolean endCall) {
+            this.endCall = endCall;
+        }
+
+        public boolean endCall() {
+            return endCall;
+        }
+    }
+
+    public record RoundResult(AdvisorDecision decision, Verdict verdict, FnolCase.Status caseStatus, String note) {}
 
     private final ChatClient chat;                 // null when no chat model / disabled
     private final ToolCallbackProvider tools;
@@ -129,27 +178,33 @@ public class ClaimAdvisor {
 
     /**
      * Runs one advisor round on a newly transcribed segment. Blocking (seconds to tens of
-     * seconds); the caller runs it on the session's advisor executor.
+     * seconds); the caller runs it on the call's advisor executor.
      */
-    public AdvisorDecision advance(FnolCase c, int segmentNo, String transcript) {
+    public RoundResult advance(FnolCase c, int segmentNo, String transcript) {
         if (chat == null) throw new IllegalStateException("claim advisor is disabled");
+        if (c.disposed()) throw new IllegalStateException("case " + c.sessionId() + " has ended");
         c.addTranscript(segmentNo, transcript);
         long started = System.nanoTime();
         LocalDate today = LocalDate.now(clock);
+        log.info("[{}] advisor round {} starts: {} earlier messages, {} policy elements known in this call",
+                c.sessionId(), c.rounds().size() + 1, c.history().size(), c.policyElements().size());
 
-        // Step 1 — identity + loss date, re-extracted until both are established.
-        if (!c.hasValidHetu() || !c.hasLossDate()) {
-            FnolExtraction extraction = extract(c, today);
-            c.applyExtraction(extraction);
-            log.info("[{}] extraction: hetu={} ({}), lossDate={}, caller={}, loss={}",
-                    c.sessionId(), c.hetuHeard() == null ? "-" : c.hetuHeard(),
-                    c.hasValidHetu() ? "VALID" : Hetu.problem(c.hetuHeard()),
-                    c.hasLossDate() ? c.lossDate() : "-",
-                    extraction == null ? "-" : extraction.callerName(),
-                    extraction == null ? "-" : extraction.lossDescription());
+        // Step 1 — identity + loss date from the whole transcript, every round (answers may correct them).
+        FnolExtraction extraction = extract(c, today);
+        c.applyExtraction(extraction);
+        log.info("[{}] extraction: hetu={} ({}), lossDate={} (evidence: {}), caller={}, loss={}",
+                c.sessionId(), c.hetuHeard() == null ? "-" : c.hetuHeard(),
+                c.hasValidHetu() ? "VALID" : Hetu.problem(c.hetuHeard()),
+                c.hasLossDate() ? c.lossDate() : "-",
+                c.lossDateEvidence() == null ? "-" : "'" + c.lossDateEvidence() + "'",
+                extraction == null ? "-" : extraction.callerName(),
+                extraction == null ? "-" : extraction.lossDescription());
+        if (extraction != null && extraction.lossDate() != null && !c.hasLossDate()) {
+            log.info("[{}] loss date {} rejected: evidence '{}' not found in the transcript",
+                    c.sessionId(), extraction.lossDate(), extraction.lossDateEvidence());
         }
 
-        // Steps 2-4 — policy discovery + decision, with tools only once the keys are known.
+        // Steps 2-4 — policy discovery + decision, tools only once the keys are known.
         boolean toolsAllowed = c.hasValidHetu() && c.hasLossDate();
         String roundText = roundMessage(c, segmentNo, transcript, today, toolsAllowed);
         var messages = new ArrayList<Message>();
@@ -158,20 +213,72 @@ public class ClaimAdvisor {
         messages.add(new UserMessage(roundText + "\n\n" + decisionConverter.getFormat()));
 
         var request = chat.prompt().messages(messages).options(options(props.reasoningEffort()));
-        if (toolsAllowed) request = request.toolCallbacks(tools);
+        if (toolsAllowed) {
+            request = request.toolCallbacks(tools).toolContext(Map.of(TahtiPolicyTools.CASE_KEY, c));
+        }
         String content = request.call().content();
         AdvisorDecision decision = decisionConverter.convert(content);
         if (decision == null || decision.status() == null) {
             throw new IllegalStateException("advisor returned no status: " + abbreviate(content, 300));
         }
-        decision = capQuestions(decision);
+        decision = capQuestions(guardKeys(c, decision));
 
         c.history().add(new UserMessage(roundText));
         c.history().add(new AssistantMessage(content));
+        RoundResult result = classify(decision);
         long millis = (System.nanoTime() - started) / 1_000_000;
-        c.recordRound(segmentNo, decision, millis);
-        logDecision(c, decision, millis);
-        return decision;
+        c.recordRound(segmentNo, decision, result.caseStatus(), result.note(), millis);
+        logDecision(c, result, millis);
+        return result;
+    }
+
+    /** Without a valid hetu and an evidenced loss date the call cannot end; make sure both are asked. */
+    private AdvisorDecision guardKeys(FnolCase c, AdvisorDecision d) {
+        if (c.hasValidHetu() && c.hasLossDate()) return d;
+        var questions = new ArrayList<>(d.questions());
+        var missing = new ArrayList<String>();
+        if (!c.hasLossDate()) {
+            missing.add("vahinkopäivä");
+            if (questions.stream().noneMatch(q -> DATE_QUESTION.matcher(q).find())) {
+                questions.add(0, "Minä päivänä vahinko tapahtui?");
+            }
+        }
+        if (!c.hasValidHetu()) {
+            missing.add("henkilötunnus");
+            if (questions.stream().noneMatch(q -> HETU_QUESTION.matcher(q).find())) {
+                questions.add(0, "Voisitteko kertoa henkilötunnuksenne numero kerrallaan?");
+            }
+        }
+        if (d.callCanEnd() || questions.size() != d.questions().size()) {
+            log.info("[{}] guard: {} missing - call continues with questions", c.sessionId(), String.join(", ", missing));
+            return d.withQuestions(questions, "(Tarkistus: " + String.join(" ja ", missing) + " puuttuu.)");
+        }
+        return d;
+    }
+
+    /** Case status is decided here, not by the model, so it cannot contradict the decision. */
+    private RoundResult classify(AdvisorDecision d) {
+        if (!d.callCanEnd()) {
+            return new RoundResult(d, Verdict.LISAKYSYMYKSET, FnolCase.Status.KESKEN, "lisäkysymyksiä avoinna");
+        }
+        if (!d.pendingEvidence().isEmpty()) {
+            return new RoundResult(d, Verdict.ODOTTAA_LISASELVITYKSIA, FnolCase.Status.KESKEN,
+                    "odottaa asiakkaan lisäselvityksiä: " + String.join("; ", d.pendingEvidence()));
+        }
+        Outcome outcome = d.outcome();
+        if (outcome == null) {
+            return new RoundResult(d, Verdict.ODOTTAA_LISASELVITYKSIA, FnolCase.Status.KESKEN, "korvausratkaisua ei annettu");
+        }
+        if (outcome != Outcome.EI_KORVATTAVA) {
+            String next = d.korvausratkaisu().seuraavatToimet();
+            if (next != null && EVIDENCE_PENDING.matcher(next).find()) {
+                return new RoundResult(d, Verdict.ODOTTAA_LISASELVITYKSIA, FnolCase.Status.KESKEN,
+                        "seuraavat toimet edellyttävät asiakkaan lisäselvityksiä");
+            }
+            return new RoundResult(d, Verdict.VALMIS_KORVAUSRATKAISUUN, FnolCase.Status.VALMIS_KORVAUSRATKAISUUN,
+                    "korvausratkaisu voidaan tehdä");
+        }
+        return new RoundResult(d, Verdict.EI_KORVATTAVA, FnolCase.Status.EI_KORVATTAVA, "vahinko ei ole korvattava");
     }
 
     private FnolExtraction extract(FnolCase c, LocalDate today) {
@@ -187,7 +294,11 @@ public class ClaimAdvisor {
 
     private String roundMessage(FnolCase c, int segmentNo, String transcript, LocalDate today, boolean toolsAllowed) {
         var sb = new StringBuilder();
-        sb.append("Kierros ").append(c.rounds().size() + 1).append(". Tänään on ").append(today).append(".\n\n");
+        int round = c.rounds().size() + 1;
+        sb.append("Puhelu ").append(c.sessionId()).append(", kierros ").append(round)
+          .append(". Tänään on ").append(today).append(".\n");
+        if (round == 1) sb.append("Tämä on puhelun ensimmäinen kierros - aiempaa keskustelua tai tulkintaa ei ole.\n");
+        sb.append('\n');
         sb.append("Uusi transkriptio (segmentti ").append(segmentNo).append("):\n\"\"\"\n")
           .append(transcript.strip()).append("\n\"\"\"\n\n");
         if (c.transcripts().size() > 1) {
@@ -201,18 +312,22 @@ public class ClaimAdvisor {
         } else {
             sb.append("- hetu: puuttuu\n");
         }
-        sb.append("- vahinkopäivä: ").append(c.hasLossDate() ? c.lossDate().toString() : "puuttuu").append('\n');
+        if (c.hasLossDate()) {
+            sb.append("- vahinkopäivä: ").append(c.lossDate()).append(" (asiakas: \"").append(c.lossDateEvidence()).append("\")\n");
+        } else {
+            sb.append("- vahinkopäivä: PUUTTUU - asiakas ei ole kertonut, milloin vahinko tapahtui; kysy se\n");
+        }
         if (c.extraction() != null) {
             if (c.extraction().callerName() != null) sb.append("- soittaja: ").append(c.extraction().callerName()).append('\n');
             if (c.extraction().lossDescription() != null) sb.append("- vahinko: ").append(c.extraction().lossDescription()).append('\n');
             if (c.extraction().otherFacts() != null) sb.append("- muut faktat: ").append(c.extraction().otherFacts()).append('\n');
         }
         sb.append("- vakuutustyökalut: ").append(toolsAllowed
-                ? "käytettävissä - tee vakuutuksen selvitys nyt"
+                ? "käytettävissä hetulla " + c.hetu() + " ja päivällä " + c.lossDate() + " - tee vakuutuksen selvitys nyt"
                 : "EI käytettävissä tällä kierroksella (hetu tai vahinkopäivä puuttuu) - pyydä puuttuva tieto").append('\n');
         List<String> asked = c.allQuestionsAsked();
         if (!asked.isEmpty()) {
-            sb.append("- aiemmin kysytyt lisäkysymykset: ").append(String.join(" | ", asked)).append('\n');
+            sb.append("- aiemmin tässä puhelussa kysytyt lisäkysymykset: ").append(String.join(" | ", asked)).append('\n');
         }
         sb.append("- enintään ").append(props.maxQuestionsPerRound()).append(" lisäkysymystä tällä kierroksella\n");
         return sb.toString();
@@ -228,30 +343,24 @@ public class ClaimAdvisor {
     private AdvisorDecision capQuestions(AdvisorDecision d) {
         List<String> q = d.questions();
         if (q.size() <= props.maxQuestionsPerRound()) return d;
-        return new AdvisorDecision(d.status(), d.hetu(), d.lossDate(), d.callerName(), d.lossDescription(),
-                d.matchedPolicy(), d.korvausratkaisu(), q.subList(0, props.maxQuestionsPerRound()),
+        return new AdvisorDecision(d.status(), d.callerName(), d.lossDescription(), d.matchedPolicy(),
+                d.korvausratkaisu(), d.lisaselvitykset(), q.subList(0, props.maxQuestionsPerRound()),
                 d.reasoning(), d.summary());
     }
 
     // ---------------------------------------------------------------- logging (steps 3-5)
 
-    private void logDecision(FnolCase c, AdvisorDecision d, long millis) {
-        String id = c.sessionId();
+    private void logDecision(FnolCase c, RoundResult r, long millis) {
+        AdvisorDecision d = r.decision();
         var sb = new StringBuilder();
-        sb.append('\n').append("[").append(id).append("] ---- KIERROS ").append(c.rounds().size())
-          .append(" (").append(millis).append(" ms) -> ").append(d.status()).append('\n');
+        sb.append('\n').append("[").append(c.sessionId()).append("] ---- KIERROS ").append(c.rounds().size())
+          .append(" (").append(millis).append(" ms) -> ").append(r.verdict())
+          .append("   tila: ").append(r.caseStatus().label()).append(" (").append(r.note()).append(")\n");
         if (d.reasoning() != null) sb.append("Perustelu: ").append(d.reasoning()).append('\n');
-        appendPolicy(sb, d);
-        if (d.isReady()) {
-            if (d.korvausratkaisu() != null) {
-                sb.append("KORVAUSRATKAISU: ").append(d.korvausratkaisu().outcome()).append(" - ")
-                  .append(d.korvausratkaisu().perustelu()).append('\n');
-                if (d.korvausratkaisu().seuraavatToimet() != null) {
-                    sb.append("Seuraavat toimet: ").append(d.korvausratkaisu().seuraavatToimet()).append('\n');
-                }
-            }
-            sb.append("=> Sano asiakkaalle: \"").append(props.closingPhrase())
-              .append("\" ja lopeta puhelu (B).\n");
+        appendPolicy(sb, c, d);
+        appendResolution(sb, d);
+        if (r.verdict().endCall()) {
+            sb.append("=> Sano asiakkaalle: \"").append(props.closingPhrase()).append("\" ja lopeta puhelu (B).\n");
         } else {
             sb.append("Transkriptio tähän mennessä:\n");
             for (FnolCase.Segment s : c.transcripts()) {
@@ -265,15 +374,18 @@ public class ClaimAdvisor {
         log.info(sb.toString());
     }
 
-    /** Step 5: final call summary, status VALMIS only if the decision was reached before hang-up. */
+    /** Step 5: final call summary; the status is the one derived before hang-up. */
     public void logSummary(FnolCase c) {
+        log.info(summaryText(c));
+    }
+
+    public String summaryText(FnolCase c) {
         String id = c.sessionId();
         AdvisorDecision d = c.lastDecision();
-        String status = c.status() == FnolCase.Status.VALMIS_KORVAUSRATKAISUUN ? "VALMIS KORVAUSRATKAISUUN" : "KESKEN";
         Duration dur = Duration.between(c.startedAt(), clock.instant());
         var sb = new StringBuilder();
         sb.append('\n').append("[").append(id).append("] ================= FNOL-YHTEENVETO =================\n");
-        sb.append("Tila: ").append(status).append('\n');
+        sb.append("Tila: ").append(c.status().label()).append(" (").append(c.statusNote()).append(")\n");
         sb.append("Puhelu: alkoi ").append(c.startedAt().atZone(ZoneId.systemDefault()).toLocalDateTime().withNano(0))
           .append(", kesto ").append(String.format("%02d:%02d", dur.toMinutes(), dur.toSecondsPart()))
           .append(", segmenttejä ").append(c.transcripts().size())
@@ -283,17 +395,13 @@ public class ClaimAdvisor {
                 .or(() -> Optional.ofNullable(c.extraction()).map(FnolExtraction::callerName)).orElse("-");
         sb.append("Soittaja: ").append(caller)
           .append("   Hetu: ").append(c.hasValidHetu() ? c.hetu() : (c.hetuHeard() == null ? "-" : c.hetuHeard() + " (ei validi)"))
-          .append("   Vahinkopäivä: ").append(c.hasLossDate() ? c.lossDate() : "-").append('\n');
+          .append("   Vahinkopäivä: ").append(c.hasLossDate() ? c.lossDate() : "- (ei kerrottu)").append('\n');
         String loss = Optional.ofNullable(d).map(AdvisorDecision::lossDescription)
                 .or(() -> Optional.ofNullable(c.extraction()).map(FnolExtraction::lossDescription)).orElse("-");
         sb.append("Vahinko: ").append(loss).append('\n');
-        if (d != null) appendPolicy(sb, d);
+        if (d != null) appendPolicy(sb, c, d);
         if (d != null && d.korvausratkaisu() != null) {
-            sb.append("Korvausratkaisu: ").append(d.korvausratkaisu().outcome()).append(" - ")
-              .append(d.korvausratkaisu().perustelu()).append('\n');
-            if (d.korvausratkaisu().seuraavatToimet() != null) {
-                sb.append("Seuraavat toimet: ").append(d.korvausratkaisu().seuraavatToimet()).append('\n');
-            }
+            appendResolution(sb, d);
         } else {
             sb.append("Korvausratkaisu: ei tehty\n");
         }
@@ -311,20 +419,69 @@ public class ClaimAdvisor {
         }
         if (c.transcripts().isEmpty()) sb.append("  (ei transkriptiota)\n");
         sb.append("[").append(id).append("] ====================================================");
-        log.info(sb.toString());
+        return sb.toString();
     }
 
-    private static void appendPolicy(StringBuilder sb, AdvisorDecision d) {
-        if (d.matchedPolicy() == null || d.matchedPolicy().isEmpty()) return;
-        sb.append("Vakuutus:\n");
-        for (AdvisorDecision.PolicyMatch m : d.matchedPolicy()) {
-            sb.append("  - ").append(nvl(m.insurable())).append(" / ").append(nvl(m.coverage()))
-              .append(" / ").append(nvl(m.risk())).append(" / ").append(nvl(m.claimType()));
-            if (m.insuranceNumber() != null) sb.append("  (").append(m.insuranceNumber()).append(')');
-            if (m.deductible() != null) sb.append("  omavastuu ").append(m.deductible());
-            if (m.terms() != null) sb.append("  ehdot ").append(m.terms());
-            sb.append('\n');
+    private static void appendResolution(StringBuilder sb, AdvisorDecision d) {
+        if (d.korvausratkaisu() != null && d.korvausratkaisu().outcome() != null) {
+            sb.append("Korvausratkaisuehdotus: ").append(d.korvausratkaisu().outcome()).append(" - ")
+              .append(d.korvausratkaisu().perustelu()).append('\n');
+            if (d.korvausratkaisu().seuraavatToimet() != null) {
+                sb.append("Seuraavat toimet: ").append(d.korvausratkaisu().seuraavatToimet()).append('\n');
+            }
         }
+        if (!d.pendingEvidence().isEmpty()) {
+            sb.append("Asiakkaalta odotettavat lisäselvitykset:\n");
+            for (String e : d.pendingEvidence()) sb.append("  - ").append(e).append('\n');
+        }
+    }
+
+    /**
+     * Policy path plus the attributes claim calculation needs. Values are read from the tool
+     * results of this call (claim type, then risk, then coverage); the model's copy is only a
+     * fallback, marked with '*'.
+     */
+    private static void appendPolicy(StringBuilder sb, FnolCase c, AdvisorDecision d) {
+        if (d.policy().isEmpty()) return;
+        sb.append("Vakuutus:\n");
+        for (PolicyMatch m : d.policy()) {
+            List<JsonNode> chain = chain(c, m);
+            sb.append("  - ").append(nvl(m.insurable())).append(" / ").append(nvl(m.coverage()))
+              .append(" / ").append(nvl(m.risk())).append(" / ").append(nvl(m.claimType())).append('\n');
+            sb.append("      Vakuutusnumero ").append(value(chain, "InsuranceNumber", m.insuranceNumber(), false))
+              .append(" | Vakuutusmäärä ").append(value(chain, "SumInsured", m.sumInsured(), true))
+              .append(" | Vakuutusmäärän peruste ").append(value(chain, "BasisForSumInsured", m.basisForSumInsured(), false))
+              .append('\n');
+            sb.append("      Omavastuu ").append(value(chain, "AmountDeductible", m.deductible(), true))
+              .append(" | Omavastuutyyppi ").append(value(chain, "DeductibleType", m.deductibleType(), false))
+              .append(" | Ehdot ").append(nvl(m.terms())).append('\n');
+        }
+    }
+
+    /** Claim type, risk and coverage elements of a match, most specific first. */
+    private static List<JsonNode> chain(FnolCase c, PolicyMatch m) {
+        Map<String, JsonNode> els = c.policyElements();
+        var out = new ArrayList<JsonNode>();
+        JsonNode claimType = m.claimTypeOid() == null ? null : els.get(m.claimTypeOid());
+        if (claimType == null && m.riskOid() != null) {
+            // The claim type of a risk is the ecoverage whose RiskOID points at it.
+            claimType = els.values().stream()
+                    .filter(e -> m.riskOid().equals(e.path("Attributes").path("RiskOID").asText(null)))
+                    .findFirst().orElse(null);
+        }
+        if (claimType != null) out.add(claimType);
+        if (m.riskOid() != null && els.get(m.riskOid()) != null) out.add(els.get(m.riskOid()));
+        if (m.coverageOid() != null && els.get(m.coverageOid()) != null) out.add(els.get(m.coverageOid()));
+        return out;
+    }
+
+    private static String value(List<JsonNode> chain, String attribute, String modelValue, boolean money) {
+        for (JsonNode el : chain) {
+            String v = el.path("Attributes").path(attribute).asText(null);
+            if (v != null && !v.isBlank()) return money ? PolicyValues.amount(v) : PolicyValues.label(v);
+        }
+        if (modelValue == null || modelValue.isBlank()) return "-";
+        return (money ? PolicyValues.amount(modelValue) : PolicyValues.label(modelValue)) + "*";
     }
 
     private static String nvl(String s) {

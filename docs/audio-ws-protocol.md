@@ -79,9 +79,17 @@ the socket without `stop` is treated as an implicit `stop`.
 { "type": "advisor", "sessionId": "...", "segment": 1, "status": "WORKING", "message": "Analysoidaan..." }
 
 { "type": "advisor", "sessionId": "...", "segment": 1, "status": "LISAKYSYMYKSET", "message": "Lisäkysymyksiä: 2",
-  "questions": ["Voisitteko toistaa henkilötunnuksenne numero kerrallaan?", "Onko pesukone kiinteästi asennettu keittiökalusteisiin?"] }
+  "caseStatus": "KESKEN", "endCall": false,
+  "questions": ["Voisitteko toistaa henkilötunnuksenne numero kerrallaan?", "Minä päivänä vahinko tapahtui?"] }
 
-{ "type": "advisor", "sessionId": "...", "segment": 2, "status": "VALMIS_KORVAUSRATKAISUUN", "message": "Kiitos, otamme teihin pian yhteyttä." }
+{ "type": "advisor", "sessionId": "...", "segment": 2, "status": "VALMIS_KORVAUSRATKAISUUN", "message": "Kiitos, otamme teihin pian yhteyttä.",
+  "caseStatus": "VALMIS_KORVAUSRATKAISUUN", "endCall": true }
+
+{ "type": "advisor", "sessionId": "...", "segment": 2, "status": "ODOTTAA_LISASELVITYKSIA", "message": "Kiitos, otamme teihin pian yhteyttä.",
+  "caseStatus": "KESKEN", "endCall": true, "pendingEvidence": ["Eläinlääkärin todistus kuolemasta"] }
+
+{ "type": "advisor", "sessionId": "...", "segment": 2, "status": "EI_KORVATTAVA", "message": "Kiitos, otamme teihin pian yhteyttä.",
+  "caseStatus": "EI_KORVATTAVA", "endCall": true }
 
 { "type": "advisor", "sessionId": "...", "segment": 2, "status": "ERROR", "message": "Neuvoja ei vastannut" }
 
@@ -101,12 +109,20 @@ Sent only when the advisor is enabled (`ready.advisorEnabled`). `WORKING`
 follows every `transcript` immediately; the verdict arrives seconds to tens
 of seconds later:
 
-| `status` | Meaning | What the handler does |
-| --- | --- | --- |
-| `WORKING` | LLM round in progress | wait |
-| `LISAKYSYMYKSET` | essential facts missing / ambiguous; `questions` lists them (also in the server log with the transcript so far) | ask the caller, then send `transcribe` again |
-| `VALMIS_KORVAUSRATKAISUUN` | identity, loss and policy match established; `message` is the closing phrase | say the phrase, send `stop` |
-| `ERROR` | round failed (model/tool error); case stays `KESKEN` | retry with `transcribe` or hang up |
+| `status` | `caseStatus` | Meaning | What the handler does |
+| --- | --- | --- | --- |
+| `WORKING` | – | LLM round in progress | wait |
+| `LISAKYSYMYKSET` | `KESKEN` | essential facts missing / ambiguous (always when hetu or loss date is missing); `questions` lists them (also in the server log with the transcript so far) | ask the caller, then send `transcribe` again |
+| `VALMIS_KORVAUSRATKAISUUN` | `VALMIS_KORVAUSRATKAISUUN` | compensable, policy match established, nothing pending | say `message`, send `stop` |
+| `EI_KORVATTAVA` | `EI_KORVATTAVA` | no valid coverage responds to the loss | say `message`, send `stop` |
+| `ODOTTAA_LISASELVITYKSIA` | `KESKEN` | all phone facts collected, but the caller must send proof (`pendingEvidence`) before a decision | say `message`, send `stop`; case stays open |
+| `ERROR` | – | round failed (model/tool error); case stays `KESKEN` | retry with `transcribe` or hang up |
+
+`caseStatus` is derived by the server from the advisor's structured answer,
+never taken from model free text, so the summary cannot contradict itself.
+Hanging up before an `endCall: true` verdict leaves the case `KESKEN`.
+After `stop` the case (LLM conversation and cached policy data) is
+discarded; the next `start` begins with an empty context.
 
 Rounds are serialised per session in segment order, and later rounds see
 the whole conversation, so a client may keep sending `transcribe` until it
@@ -119,7 +135,7 @@ have text, and for replaying transcripts during development:
 
 ```
 POST   /api/fnol/{caseId}/segments   {"text": "..."}   -> decision JSON for this round
-POST   /api/fnol/{caseId}/hangup                       -> prints the FNOL summary, returns status
+POST   /api/fnol/{caseId}/hangup                       -> prints the FNOL summary, returns status, ends the case
 DELETE /api/fnol/{caseId}
 ```
 

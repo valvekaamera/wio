@@ -13,7 +13,9 @@ namespace stream {
 enum class State { Idle, Connecting, Streaming, Stopping };
 
 // Claim-advisor verdict for the latest segment (server event "advisor").
-enum class AdvisorStatus { Working, Ready, Questions, Error };
+// Ready / NotCovered / AwaitingEvidence all mean "say the closing phrase and hang up";
+// only Ready leaves the case VALMIS KORVAUSRATKAISUUN, AwaitingEvidence keeps it KESKEN.
+enum class AdvisorStatus { Working, Ready, NotCovered, AwaitingEvidence, Questions, Error };
 
 using TranscriptCallback = void (*)(int segment, const char* text);
 using StatusCallback = void (*)(State state);

@@ -26,11 +26,14 @@ buttons C / A / B                    stores recordings/<session>/*.wav          
   - **LISÄKYSYMYKSIÄ: N** — the follow-up questions are in the server log
     (with the transcript so far); the first one is shown on the LCD. Ask
     the caller, then press **A** again — the answers join the same case.
-  - **KORVAUSRATKAISU VALMIS** — say *"Kiitos, otamme teihin pian
-    yhteyttä."* and press **B**.
+  - **VALMIS KORVAUSRATKAISUUN** (green), **EI KORVATTAVA** (red) or
+    **KESKEN - odottaa lisäselvityksiä** (yellow, the caller must send
+    proof afterwards) — say *"Kiitos, otamme teihin pian yhteyttä."* and
+    press **B**.
 - **B** sends `stop`: the backend writes `session.wav` and prints the
-  **FNOL-YHTEENVETO** with status `VALMIS KORVAUSRATKAISUUN` or `KESKEN`
-  (hanging up at any time yields `KESKEN`).
+  **FNOL-YHTEENVETO** with status `VALMIS KORVAUSRATKAISUUN`,
+  `EI KORVATTAVA` or `KESKEN` (hanging up before a verdict yields `KESKEN`).
+  The call's LLM context is then discarded.
 
 The wire contract is in [`docs/audio-ws-protocol.md`](docs/audio-ws-protocol.md);
 backend setup and configuration in [`backend/README.md`](backend/README.md).
